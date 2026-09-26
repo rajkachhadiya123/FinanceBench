@@ -1,0 +1,184 @@
+"""
+Hybrid retriever: dense (FAISS) + keyword (BM25), fused with RRF, with
+optional overlap de-duplication and cross-encoder re-ranking.
+
+The three optional stages are off by default so a baseline can be measured
+first and each addition attributed separately:
+    dedup=False      -- drop adjacent chunks that overlap the same text
+    rerank=False      -- re-score candidates with a cross-encoder
+
+Position N means the same chunk in every index (FAISS vector N, BM25
+document N, line N of chunks.jsonl and chunk_meta.jsonl). That invariant is
+what makes fusion possible; it holds because every builder streamed
+chunks.jsonl in file order.
+"""
+import json
+from pathlib import Path
+
+import bm25s
+import faiss
+import numpy as np
+import Stemmer
+from sentence_transformers import SentenceTransformer
+
+ROOT = Path(__file__).resolve().parents[2]
+PROCESSED = ROOT / "data" / "PROCESSED"
+CHUNKS_PATH = PROCESSED / "chunks.jsonl"
+META_PATH = PROCESSED / "chunk_meta.jsonl"
+FAISS_PATH = PROCESSED / "faiss.index"
+BM25_DIR = PROCESSED / "bm25_index"
+
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Smaller/faster than BAAI/bge-reranker-base, which matters on CPU. Swap if
+# accuracy matters more than latency.
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+RRF_K = 60  # standard RRF damping constant
+CANDIDATES_K = 20  # how many each retriever contributes before fusion
+
+
+class Retriever:
+    def __init__(self, use_reranker: bool = False):
+        print("Loading indexes ...")
+        self.embedder = SentenceTransformer(EMBED_MODEL)
+        self.stemmer = Stemmer.Stemmer("english")
+        self.faiss_index = faiss.read_index(str(FAISS_PATH))
+        self.bm25 = bm25s.BM25.load(str(BM25_DIR), mmap=True)
+        self.meta = self._load_meta()
+
+        self._chunks_file = open(CHUNKS_PATH, "rb")  # kept open for seek-reads
+
+        self.reranker = None
+        if use_reranker:
+            from sentence_transformers import CrossEncoder
+
+            print(f"Loading reranker: {RERANK_MODEL}")
+            self.reranker = CrossEncoder(RERANK_MODEL)
+
+        if self.faiss_index.ntotal != len(self.meta):
+            raise RuntimeError(
+                f"Index mismatch: FAISS has {self.faiss_index.ntotal} vectors "
+                f"but metadata has {len(self.meta)} rows. Rebuild the indexes."
+            )
+        print(f"Ready: {len(self.meta)} chunks indexed.")
+
+    @staticmethod
+    def _load_meta() -> list[dict]:
+        with open(META_PATH, "rb") as f:
+            return [json.loads(line) for line in f]
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        dedup: bool = False,
+        rerank: bool = False,
+    ) -> list[dict]:
+        dense_ranked = self._dense_search(query, CANDIDATES_K)
+        bm25_ranked = self._bm25_search(query, CANDIDATES_K)
+        fused = self._rrf_fuse([dense_ranked, bm25_ranked])
+
+        if dedup:
+            fused = self._drop_overlapping(fused)
+
+        if rerank:
+            if self.reranker is None:
+                raise RuntimeError("Retriever was built with use_reranker=False.")
+            fused = self._rerank(query, fused, top_k)
+
+        return [self._build_result(pos, rank) for rank, pos in enumerate(fused[:top_k], 1)]
+
+    def _dense_search(self, query: str, k: int) -> list[int]:
+        # normalize_embeddings must match how chunks were embedded, or the
+        # inner-product index returns meaningless distances.
+        vec = self.embedder.encode(
+            [query], convert_to_numpy=True, normalize_embeddings=True
+        ).astype(np.float32)
+        _scores, positions = self.faiss_index.search(vec, k)
+        return [int(p) for p in positions[0] if p >= 0]
+
+    def _bm25_search(self, query: str, k: int) -> list[int]:
+        # Same stopwords + stemmer as bm25_builder.py, so query terms map onto
+        # the index's vocabulary.
+        tokens = bm25s.tokenize(
+            query, stopwords="en", stemmer=self.stemmer, return_ids=False, show_progress=False
+        )
+        positions, _scores = self.bm25.retrieve(tokens, k=k, show_progress=False)
+        return [int(p) for p in positions[0]]
+
+    @staticmethod
+    def _rrf_fuse(ranked_lists: list[list[int]], k: int = RRF_K) -> list[int]:
+        """Reciprocal Rank Fusion: score by 1/(k + rank), summed across lists."""
+        scores: dict[int, float] = {}
+        for ranked in ranked_lists:
+            for rank, position in enumerate(ranked, 1):
+                scores[position] = scores.get(position, 0.0) + 1.0 / (k + rank)
+        return sorted(scores, key=scores.get, reverse=True)
+
+    def _drop_overlapping(self, positions: list[int]) -> list[int]:
+        """
+        Chunks step 1700 chars but span 2000, so only *adjacent* chunks of the
+        same document share text. Keep whichever ranked higher.
+        """
+        kept: list[int] = []
+        for pos in positions:
+            meta = self.meta[pos]
+            doc, idx = meta["doc_name"], self._chunk_index(meta["chunk_id"])
+            if any(
+                self.meta[k]["doc_name"] == doc
+                and abs(self._chunk_index(self.meta[k]["chunk_id"]) - idx) <= 1
+                for k in kept
+            ):
+                continue
+            kept.append(pos)
+        return kept
+
+    @staticmethod
+    def _chunk_index(chunk_id: str) -> int:
+        return int(chunk_id.rsplit("__", 1)[1])
+
+    def _rerank(self, query: str, positions: list[int], top_k: int) -> list[int]:
+        """Re-score candidates by reading query and chunk text together."""
+        texts = [self._chunk_text(p) for p in positions]
+        scores = self.reranker.predict([(query, t) for t in texts], show_progress_bar=False)
+        order = np.argsort(scores)[::-1]
+        return [positions[i] for i in order[:top_k]]
+
+    def _chunk_text(self, position: int) -> str:
+        """Seek straight to this chunk's line instead of holding 230 MB in RAM."""
+        self._chunks_file.seek(self.meta[position]["byte_offset"])
+        return json.loads(self._chunks_file.readline().decode("utf-8"))["text"]
+
+    def _build_result(self, position: int, rank: int) -> dict:
+        meta = self.meta[position]
+        return {
+            "rank": rank,
+            "position": position,
+            "chunk_id": meta["chunk_id"],
+            "doc_name": meta["doc_name"],
+            "page_start": meta["page_start"],
+            "page_end": meta["page_end"],
+            "text": self._chunk_text(position),
+        }
+
+    def close(self):
+        self._chunks_file.close()
+
+
+def main():
+    """Quick manual check that retrieval returns something sensible."""
+    retriever = Retriever(use_reranker=False)
+    query = "What was 3M's FY2018 net income including noncontrolling interest?"
+
+    print(f"\nQuery: {query}\n")
+    for hit in retriever.search(query, top_k=5):
+        preview = " ".join(hit["text"].split())[:160]
+        print(f"{hit['rank']}. {hit['doc_name']} p.{hit['page_start']}-{hit['page_end']} "
+              f"[{hit['chunk_id']}]")
+        print(f"   {preview.encode('ascii', 'replace').decode('ascii')}\n")
+
+    retriever.close()
+
+
+if __name__ == "__main__":
+    main()
