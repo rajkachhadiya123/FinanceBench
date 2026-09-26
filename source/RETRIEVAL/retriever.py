@@ -2,10 +2,12 @@
 Hybrid retriever: dense (FAISS) + keyword (BM25), fused with RRF, with
 optional overlap de-duplication and cross-encoder re-ranking.
 
-The three optional stages are off by default so a baseline can be measured
-first and each addition attributed separately:
-    dedup=False      -- drop adjacent chunks that overlap the same text
-    rerank=False      -- re-score candidates with a cross-encoder
+The optional stages are off by default so a baseline can be measured first and
+each addition attributed separately:
+    metadata_filter=False -- restrict the search to filings matching the
+                             company and fiscal year named in the question
+    dedup=False           -- drop adjacent chunks that overlap the same text
+    rerank=False          -- re-score candidates with a cross-encoder
 
 Position N means the same chunk in every index (FAISS vector N, BM25
 document N, line N of chunks.jsonl and chunk_meta.jsonl). That invariant is
@@ -13,6 +15,7 @@ what makes fusion possible; it holds because every builder streamed
 chunks.jsonl in file order.
 """
 import json
+import sys
 from pathlib import Path
 
 import bm25s
@@ -22,6 +25,9 @@ import Stemmer
 from sentence_transformers import SentenceTransformer
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))  # so this module also works when run directly
+
+from source.RETRIEVAL.metadata_filter import MetadataFilter  # noqa: E402
 PROCESSED = ROOT / "data" / "PROCESSED"
 CHUNKS_PATH = PROCESSED / "chunks.jsonl"
 META_PATH = PROCESSED / "chunk_meta.jsonl"
@@ -35,6 +41,9 @@ RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 RRF_K = 60  # standard RRF damping constant
 CANDIDATES_K = 20  # how many each retriever contributes before fusion
+# Fusion can yield up to 2x CANDIDATES_K unique chunks; cap what the
+# cross-encoder scores, since it runs on CPU and cannot be precomputed.
+RERANK_CANDIDATES = 20
 
 
 class Retriever:
@@ -47,6 +56,13 @@ class Retriever:
         self.meta = self._load_meta()
 
         self._chunks_file = open(CHUNKS_PATH, "rb")  # kept open for seek-reads
+
+        self.positions_by_doc: dict[str, list[int]] = {}
+        for position, meta in enumerate(self.meta):
+            self.positions_by_doc.setdefault(meta["doc_name"], []).append(position)
+        self.metadata_filter = MetadataFilter(list(self.positions_by_doc))
+        # Reused across queries so we don't allocate a 107K-element array per search.
+        self._mask_buffer = np.zeros(len(self.meta), dtype=np.float32)
 
         self.reranker = None
         if use_reranker:
@@ -71,11 +87,22 @@ class Retriever:
         self,
         query: str,
         top_k: int = 5,
+        metadata_filter: bool = False,
         dedup: bool = False,
         rerank: bool = False,
+        oracle_doc: str | None = None,
     ) -> list[dict]:
-        dense_ranked = self._dense_search(query, CANDIDATES_K)
-        bm25_ranked = self._bm25_search(query, CANDIDATES_K)
+        allowed_positions = None
+        if oracle_doc is not None:
+            # Diagnostic only: uses the benchmark's ground-truth document, which
+            # a real system would not know. Measures the ceiling that perfect
+            # company/year extraction could reach.
+            allowed_positions = self._positions_for_docs({oracle_doc})
+        elif metadata_filter:
+            allowed_positions = self._allowed_positions(query)
+
+        dense_ranked = self._dense_search(query, CANDIDATES_K, allowed_positions)
+        bm25_ranked = self._bm25_search(query, CANDIDATES_K, allowed_positions)
         fused = self._rrf_fuse([dense_ranked, bm25_ranked])
 
         if dedup:
@@ -88,22 +115,47 @@ class Retriever:
 
         return [self._build_result(pos, rank) for rank, pos in enumerate(fused[:top_k], 1)]
 
-    def _dense_search(self, query: str, k: int) -> list[int]:
+    def _allowed_positions(self, query: str) -> np.ndarray | None:
+        """Chunk positions belonging to filings that match the question's company/year."""
+        allowed_docs = self.metadata_filter.allowed_docs(query)
+        if allowed_docs is None:
+            return None  # company not identified -- search everything
+        return self._positions_for_docs(allowed_docs)
+
+    def _positions_for_docs(self, doc_names: set[str]) -> np.ndarray | None:
+        positions = [p for doc in doc_names for p in self.positions_by_doc.get(doc, [])]
+        return np.array(sorted(positions), dtype=np.int64) if positions else None
+
+    def _dense_search(self, query: str, k: int, allowed: np.ndarray | None = None) -> list[int]:
         # normalize_embeddings must match how chunks were embedded, or the
         # inner-product index returns meaningless distances.
         vec = self.embedder.encode(
             [query], convert_to_numpy=True, normalize_embeddings=True
         ).astype(np.float32)
-        _scores, positions = self.faiss_index.search(vec, k)
+
+        params = None
+        if allowed is not None:
+            params = faiss.SearchParameters(sel=faiss.IDSelectorBatch(allowed))
+        _scores, positions = self.faiss_index.search(vec, k, params=params)
         return [int(p) for p in positions[0] if p >= 0]
 
-    def _bm25_search(self, query: str, k: int) -> list[int]:
+    def _bm25_search(self, query: str, k: int, allowed: np.ndarray | None = None) -> list[int]:
         # Same stopwords + stemmer as bm25_builder.py, so query terms map onto
         # the index's vocabulary.
         tokens = bm25s.tokenize(
             query, stopwords="en", stemmer=self.stemmer, return_ids=False, show_progress=False
         )
-        positions, _scores = self.bm25.retrieve(tokens, k=k, show_progress=False)
+
+        mask = None
+        if allowed is not None:
+            self._mask_buffer.fill(0.0)
+            self._mask_buffer[allowed] = 1.0
+            mask = self._mask_buffer
+            k = min(k, len(allowed))
+
+        positions, _scores = self.bm25.retrieve(
+            tokens, k=k, weight_mask=mask, show_progress=False
+        )
         return [int(p) for p in positions[0]]
 
     @staticmethod
@@ -138,11 +190,36 @@ class Retriever:
         return int(chunk_id.rsplit("__", 1)[1])
 
     def _rerank(self, query: str, positions: list[int], top_k: int) -> list[int]:
-        """Re-score candidates by reading query and chunk text together."""
-        texts = [self._chunk_text(p) for p in positions]
-        scores = self.reranker.predict([(query, t) for t in texts], show_progress_bar=False)
+        """
+        Re-score candidates by reading query and chunk text together.
+
+        Unlike the bi-encoder, this sees the query while reading the chunk, and
+        reads up to 512 tokens -- so it is not subject to the 256-token
+        truncation that limits our stored vectors.
+        """
+        candidates = positions[:RERANK_CANDIDATES]
+        rest = positions[RERANK_CANDIDATES:]
+
+        pairs = [(query, self._rerank_document(p)) for p in candidates]
+        scores = self.reranker.predict(pairs, show_progress_bar=False)
         order = np.argsort(scores)[::-1]
-        return [positions[i] for i in order[:top_k]]
+        return [candidates[i] for i in order] + rest
+
+    def _rerank_document(self, position: int) -> str:
+        """
+        Chunk text prefixed with a context header, so the cross-encoder can
+        distinguish near-identical filings (3M's 2018 vs 2021 10-K read almost
+        the same without knowing which is which).
+
+        Only the reranker sees this; FAISS and BM25 scores come from indexes
+        built at ingest time on raw text.
+        """
+        meta = self.meta[position]
+        header = (
+            f"[Document: {meta['doc_name']} | "
+            f"Page: {meta['page_start']}-{meta['page_end']}]"
+        )
+        return f"{header}\n{self._chunk_text(position)}"
 
     def _chunk_text(self, position: int) -> str:
         """Seek straight to this chunk's line instead of holding 230 MB in RAM."""
