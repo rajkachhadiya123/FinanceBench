@@ -99,6 +99,19 @@ def answer_in_text(answer: str, text: str) -> bool:
     return keyword_ratio(answer, text) >= KEYWORD_PASS_RATIO
 
 
+def answer_is_retrievable(record: dict) -> bool:
+    """
+    Could ANY retriever satisfy this question's answer check?
+
+    38% of FinanceBench answers must be computed (ratios, multi-year averages,
+    year-over-year deltas), so the expected value appears nowhere in the
+    filing. Scoring those as retrieval failures understates quality by ~17pp,
+    so they are excluded from the "% of achievable" denominator.
+    """
+    evidence_text = "\n".join(ev["evidence_text"] for ev in record["evidence"])
+    return answer_in_text(str(record["answer"]), evidence_text)
+
+
 def page_is_evidence(hit: dict, evidence: list[dict]) -> bool:
     """A chunk counts as a hit if it spans the labelled evidence page of that document."""
     for ev in evidence:
@@ -159,6 +172,8 @@ def evaluate(retriever: Retriever, config: dict) -> list[dict]:
                 "answer_hit": any(h["answer_match"] for h in scored_hits),
                 "doc_hit": any(h["doc_match"] for h in scored_hits),
                 "grounded_hit": any(h["grounded_answer"] for h in scored_hits),
+                "question_type": record["question_type"],
+                "retrievable": answer_is_retrievable(record),
             }
         )
 
@@ -186,6 +201,12 @@ def summarize(results: list[dict]) -> dict:
             1 for r in results if r["doc_hit"] and not r["page_hit"]
         ),
         "wrong_doc": sum(1 for r in results if not r["doc_hit"]),
+        # Questions whose answer is written down somewhere and could therefore
+        # be retrieved at all -- the honest denominator.
+        "retrievable": sum(1 for r in results if r["retrievable"]),
+        "grounded_of_retrievable": sum(
+            1 for r in results if r["retrievable"] and r["grounded_hit"]
+        ),
     }
 
 
@@ -240,6 +261,11 @@ def build_pdf(results: list[dict], stats: dict, config: dict, report_path: Path)
         ["Metric", "Result", "What it means"],
         ["Grounded answer", f"{stats['grounded_hit']}/{n}  ({stats['grounded_hit']/n:.1%})",
          "PRIMARY: expected value found, in the correct document"],
+        ["...of achievable",
+         f"{stats['grounded_of_retrievable']}/{stats['retrievable']}  "
+         f"({stats['grounded_of_retrievable']/stats['retrievable']:.1%})",
+         f"Excludes {n - stats['retrievable']} questions whose answer must be "
+         "computed (ratios, averages, deltas) and appears in no filing"],
         ["Correct document", f"{stats['doc_hit']}/{n}  ({stats['doc_hit']/n:.1%})",
          f"Correct filing appeared in top {TOP_K} (any page)"],
         ["Hit@1 (page)", f"{stats['hit1']}/{n}  ({stats['hit1']/n:.1%})",
@@ -361,8 +387,12 @@ def main():
     n = stats["total"]
     print(f"\n===== RETRIEVAL: {label} =====")
     print(f"Questions:              {n}     ({elapsed:.0f}s, {elapsed/n:.2f}s/question)")
+    retrievable = stats["retrievable"]
     print(f"GROUNDED ANSWER:        {stats['grounded_hit']}/{n}  "
           f"({stats['grounded_hit']/n:.1%})   <-- primary metric")
+    print(f"  of ACHIEVABLE:        {stats['grounded_of_retrievable']}/{retrievable}  "
+          f"({stats['grounded_of_retrievable']/retrievable:.1%})   <-- excludes the "
+          f"{n - retrievable} questions whose answer must be computed")
     print(f"Correct document:       {stats['doc_hit']}/{n}  ({stats['doc_hit']/n:.1%})")
     print(f"Hit@1 (page):           {stats['hit1']}/{n}  ({stats['hit1']/n:.1%})")
     print(f"Hit@3 (page):           {stats['hit3']}/{n}  ({stats['hit3']/n:.1%})")
