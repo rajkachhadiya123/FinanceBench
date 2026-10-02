@@ -41,6 +41,27 @@ RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 RRF_K = 60  # standard RRF damping constant
 CANDIDATES_K = 20  # how many each retriever contributes before fusion
+
+# Many questions name the statement(s) they need ("basing your answers off of
+# the cash flow statement and the income statement"). When that hint is
+# present, searching per-statement covers several statements deliberately
+# instead of hoping one large top-k happens to span them. Each key maps the
+# phrases a question might use to the heading text the filing actually prints.
+STATEMENT_HINTS = {
+    "cash_flow": (
+        ("cash flow statement", "statement of cash flows", "cash flows", "statements of cash flow"),
+        "consolidated statements of cash flows operating activities",
+    ),
+    "income": (
+        ("income statement", "statement of income", "statements of income", "p&l",
+         "profit and loss", "statement of operations", "statements of operations"),
+        "consolidated statements of income net revenue operating income",
+    ),
+    "balance_sheet": (
+        ("balance sheet", "statement of financial position", "balance sheets"),
+        "consolidated balance sheets total current assets liabilities",
+    ),
+}
 # Fusion can yield up to 2x CANDIDATES_K unique chunks; cap what the
 # cross-encoder scores, since it runs on CPU and cannot be precomputed.
 RERANK_CANDIDATES = 20
@@ -91,6 +112,7 @@ class Retriever:
         dedup: bool = False,
         rerank: bool = False,
         oracle_doc: str | None = None,
+        targeted: bool = False,
     ) -> list[dict]:
         allowed_positions = None
         if oracle_doc is not None:
@@ -101,9 +123,17 @@ class Retriever:
         elif metadata_filter:
             allowed_positions = self._allowed_positions(query)
 
-        dense_ranked = self._dense_search(query, CANDIDATES_K, allowed_positions)
-        bm25_ranked = self._bm25_search(query, CANDIDATES_K, allowed_positions)
-        fused = self._rrf_fuse([dense_ranked, bm25_ranked])
+        queries = [query]
+        if targeted:
+            # Only splits when the question actually names statements; otherwise
+            # this is exactly the single-query path.
+            queries = self._statement_queries(query) or [query]
+
+        ranked_lists = []
+        for sub_query in queries:
+            ranked_lists.append(self._dense_search(sub_query, CANDIDATES_K, allowed_positions))
+            ranked_lists.append(self._bm25_search(sub_query, CANDIDATES_K, allowed_positions))
+        fused = self._rrf_fuse(ranked_lists)
 
         if dedup:
             fused = self._drop_overlapping(fused)
@@ -114,6 +144,24 @@ class Retriever:
             fused = self._rerank(query, fused, top_k)
 
         return [self._build_result(pos, rank) for rank, pos in enumerate(fused[:top_k], 1)]
+
+    @staticmethod
+    def _statement_queries(query: str) -> list[str]:
+        """
+        One sub-query per financial statement the question names, or [] if it
+        names none -- in which case the caller keeps the original single query.
+
+        Each sub-query appends the heading wording filings actually print, which
+        steers BM25 toward the statement itself rather than passing mentions.
+        """
+        lowered = query.lower()
+        sub_queries = []
+        for phrases, heading in STATEMENT_HINTS.values():
+            if any(phrase in lowered for phrase in phrases):
+                sub_queries.append(f"{query} {heading}")
+        # A single hint adds nothing over the plain query, so only split when
+        # the question genuinely spans more than one statement.
+        return sub_queries if len(sub_queries) > 1 else []
 
     def _allowed_positions(self, query: str) -> np.ndarray | None:
         """Chunk positions belonging to filings that match the question's company/year."""
