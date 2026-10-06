@@ -35,7 +35,7 @@ from reportlab.platypus import (
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from source.RETRIEVAL.retriever import Retriever  # noqa: E402
+from source.RETRIEVAL.retriever import DEFAULT_EMBEDDING, Retriever  # noqa: E402
 
 QUESTIONS_PATH = ROOT / "data" / "EVAL" / "financebench_open_source.jsonl"
 REPORTS_DIR = ROOT / "documentation" / "reports"
@@ -125,6 +125,10 @@ def page_is_evidence(hit: dict, evidence: list[dict]) -> bool:
 def evaluate(retriever: Retriever, config: dict) -> list[dict]:
     with open(QUESTIONS_PATH, encoding="utf-8") as f:
         questions = [json.loads(line) for line in f]
+    if config["retrievable_only"]:
+        # Only questions whose answer is written in the evidence -- the ones
+        # retrieval alone can satisfy, with no LLM arithmetic required.
+        questions = [q for q in questions if answer_is_retrievable(q)]
 
     results = []
     start = time.time()
@@ -236,13 +240,17 @@ def build_pdf(results: list[dict], stats: dict, config: dict, report_path: Path)
 
     enabled = [name for name in ("filter", "dedup", "rerank", "oracle") if config[name]]
     config_line = ", ".join(enabled) if enabled else "none (baseline)"
+    question_set = ("only questions answerable without an LLM (answer written in the evidence)"
+                    if config["retrievable_only"] else "all questions")
 
     story = [
         Paragraph("FinanceBench Retrieval Evaluation", styles["Title"]),
         Paragraph(
             "Hybrid retrieval (BM25 + dense embeddings, RRF fusion) &mdash; "
             f"top {TOP_K} results per question.<br/>"
-            f"<b>Stages enabled:</b> {config_line}",
+            f"<b>Dense model:</b> {config['embedding']}<br/>"
+            f"<b>Stages enabled:</b> {config_line}<br/>"
+            f"<b>Question set:</b> {question_set} ({stats['total']})",
             body,
         ),
     ]
@@ -368,6 +376,14 @@ def main():
     }
     enabled = [name for name, on in config.items() if on]
     label = "+".join(enabled) if enabled else "baseline"
+    # Kept out of `enabled`: these choose the model and question set, not
+    # pipeline stages. The model is always in the label so a report's name
+    # says which index produced it.
+    config["embedding"] = "minilm" if "--minilm" in sys.argv else DEFAULT_EMBEDDING
+    config["retrievable_only"] = "--retrievable-only" in sys.argv
+    label += f"+{config['embedding']}"
+    if config["retrievable_only"]:
+        label += "+retrievable"
 
     if config["oracle"]:
         print("\n" + "!" * 72)
@@ -376,7 +392,7 @@ def main():
         print("! deployed system would never have. Measures a ceiling, not accuracy.")
         print("!" * 72)
 
-    retriever = Retriever(use_reranker=config["rerank"])
+    retriever = Retriever(use_reranker=config["rerank"], embedding=config["embedding"])
     print(f"\nEvaluating top-{TOP_K} retrieval -- config: {label} ...")
     start = time.time()
     results = evaluate(retriever, config)

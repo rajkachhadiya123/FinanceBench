@@ -27,14 +27,26 @@ from sentence_transformers import SentenceTransformer
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))  # so this module also works when run directly
 
+from source.INGESTION import embedder, embedder2  # noqa: E402
 from source.RETRIEVAL.metadata_filter import MetadataFilter  # noqa: E402
 PROCESSED = ROOT / "data" / "PROCESSED"
 CHUNKS_PATH = PROCESSED / "chunks.jsonl"
 META_PATH = PROCESSED / "chunk_meta.jsonl"
-FAISS_PATH = PROCESSED / "faiss.index"
 BM25_DIR = PROCESSED / "bm25_index"
 
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Each dense index must be queried with the exact model (and query prefix) that
+# built it, or the scores are meaningless -- so both are read from the builder
+# modules rather than retyped here.
+EMBEDDINGS = {
+    "minilm": {"model": embedder.MODEL_NAME, "index": embedder.INDEX_PATH, "query_prefix": ""},
+    "bge": {"model": embedder2.MODEL_NAME, "index": embedder2.INDEX_PATH,
+            "query_prefix": embedder2.QUERY_PREFIX},
+}
+# BGE vs MiniLM on the 80 questions whose answer is written in the evidence
+# (strict matching -- years not counted as answer values): grounded@5 40 -> 45
+# (fixed 9, broke 4, McNemar p = 0.27). Directionally better, not yet
+# significant. MiniLM kept for comparison.
+DEFAULT_EMBEDDING = "bge"
 # Smaller/faster than BAAI/bge-reranker-base, which matters on CPU. Swap if
 # accuracy matters more than latency.
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -68,11 +80,15 @@ RERANK_CANDIDATES = 20
 
 
 class Retriever:
-    def __init__(self, use_reranker: bool = False):
-        print("Loading indexes ...")
-        self.embedder = SentenceTransformer(EMBED_MODEL)
+    def __init__(self, use_reranker: bool = False, embedding: str = DEFAULT_EMBEDDING):
+        if embedding not in EMBEDDINGS:
+            raise ValueError(f"Unknown embedding {embedding!r}; choose from {list(EMBEDDINGS)}")
+        spec = EMBEDDINGS[embedding]
+        print(f"Loading indexes (dense: {spec['model']}) ...")
+        self.embedder = SentenceTransformer(spec["model"])
+        self.query_prefix = spec["query_prefix"]
         self.stemmer = Stemmer.Stemmer("english")
-        self.faiss_index = faiss.read_index(str(FAISS_PATH))
+        self.faiss_index = faiss.read_index(str(spec["index"]))
         self.bm25 = bm25s.BM25.load(str(BM25_DIR), mmap=True)
         self.meta = self._load_meta()
 
@@ -176,9 +192,10 @@ class Retriever:
 
     def _dense_search(self, query: str, k: int, allowed: np.ndarray | None = None) -> list[int]:
         # normalize_embeddings must match how chunks were embedded, or the
-        # inner-product index returns meaningless distances.
+        # inner-product index returns meaningless distances. The prefix is
+        # query-side only (empty for MiniLM; BGE's retrieval instruction).
         vec = self.embedder.encode(
-            [query], convert_to_numpy=True, normalize_embeddings=True
+            [self.query_prefix + query], convert_to_numpy=True, normalize_embeddings=True
         ).astype(np.float32)
 
         params = None

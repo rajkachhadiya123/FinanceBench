@@ -1,16 +1,20 @@
 """
-End-to-end smoke test: retrieval -> Gemini -> answer, printed side by side
+End-to-end smoke test: retrieval -> LLM (Groq) -> answer, printed side by side
 against the expected answer.
 
-By default it selects questions whose answer does NOT appear in their own
-labelled evidence -- the ones requiring calculation. Those are both the hardest
-case and the ones retrieval alone can never satisfy, so they isolate whether
-the model can actually do the arithmetic.
+With --computed-only it selects questions whose answer is NOT written in their
+own labelled evidence -- the ones requiring calculation or synthesis. Those are
+both the hardest case and the ones retrieval alone can never satisfy, so they
+isolate whether the model can actually do the work.
 
 Usage:
     python tools/test_answers.py                    # 10 questions, top_k=5
     python tools/test_answers.py --n 15 --top-k 15
-    python tools/test_answers.py --all-types        # don't filter to computed answers
+    python tools/test_answers.py --computed-only --include-holdout --n 200
+                                                    # every LLM-dependent question
+
+Free-tier quota: answers are cached as they arrive, and the run stops cleanly
+when the daily quota is spent. Rerun the same command the next day to continue.
 
 The sample is a deterministic prefix of one shuffled ordering, so a run with
 --n 10 tests a subset of --n 15. That makes results comparable across runs --
@@ -28,11 +32,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from source.GENERATION.answer_generator import AnswerGenerator  # noqa: E402
+from source.GENERATION.answer_generator import AnswerGenerator, DailyLimitReached  # noqa: E402
 from source.RETRIEVAL.retriever import Retriever  # noqa: E402
 from tools.evaluate_retrieval import (  # noqa: E402
-    answer_is_retrievable,
+    KEYWORD_PASS_RATIO,
     extract_numbers,
+    keyword_ratio,
     number_present,
 )
 
@@ -42,7 +47,15 @@ QUESTIONS_PATH = ROOT / "data" / "EVAL" / "financebench_open_source.jsonl"
 # discarding completed answers the expensive mistake.
 RESULTS_PATH = ROOT / "data" / "PROCESSED" / "answer_results.jsonl"
 DEFAULT_TOP_K = 5
-REQUEST_SPACING = 5  # seconds between questions, to stay under per-minute limits
+REQUEST_SPACING = 5  # minimum seconds between questions
+# Groq free tier: 8000 tokens/minute. After each call, wait long enough that the
+# tokens it used fit inside the per-minute budget, instead of hitting 429s.
+TOKENS_PER_MINUTE = 8000
+RETRY_TOP_K = 10  # on a NOT FOUND, ask again once with this many chunks
+
+
+def is_refusal(answer: str) -> bool:
+    return answer.strip().upper().startswith("NOT FOUND")
 
 
 def load_cached_results() -> dict[str, dict]:
@@ -85,9 +98,33 @@ def load_questions(computed_only: bool, include_holdout: bool = False) -> list[d
         questions = [q for q in questions if q["financebench_id"] not in holdout_ids]
 
     if computed_only:
-        # answer_is_retrievable() == False  =>  the value must be calculated
-        questions = [q for q in questions if not answer_is_retrievable(q)]
+        questions = [q for q in questions if not answer_written_in_evidence(q)]
     return questions
+
+
+UNIT_RE = re.compile(r"\$|\b(million|billion|thousand|mn|bn|usd)\b", re.IGNORECASE)
+
+
+def answer_written_in_evidence(record: dict) -> bool:
+    """
+    Is the expected answer literally present in the labelled evidence? If not,
+    only an LLM (calculation or synthesis) can produce it.
+
+    Stricter than evaluate_retrieval.answer_is_retrievable, which counted 13
+    LLM-dependent questions as retrievable because (1) years in the answer
+    ("in FY 2022") matched any year in the evidence, (2) "COVID-19" parsed as
+    -19, and (3) unit scaling let a ratio like 0.83 match 833,033. Here years
+    are ignored and scaling applies only when the answer states a unit.
+    """
+    answer = str(record["answer"])
+    evidence = "\n".join(e["evidence_text"] for e in record["evidence"])
+    expected = meaningful_numbers(re.sub(r"COVID-19", "", answer, flags=re.IGNORECASE))
+    if not expected:
+        return keyword_ratio(answer, evidence) >= KEYWORD_PASS_RATIO
+    found = extract_numbers(evidence)
+    if UNIT_RE.search(answer):
+        return any(number_present(n, found) for n in expected)
+    return any(abs(n - c) <= 0.01 * max(abs(n), abs(c), 1e-9) for n in expected for c in found)
 
 
 def stratified_sample(questions: list[dict], n: int) -> list[dict]:
@@ -175,13 +212,19 @@ def main():
     if "--top-k" in sys.argv:
         top_k = int(sys.argv[sys.argv.index("--top-k") + 1])
     computed_only = "--computed-only" in sys.argv
+    include_holdout = "--include-holdout" in sys.argv
     targeted = "--no-targeted" not in sys.argv
+    retry_top_k = RETRY_TOP_K  # 0 disables the wider retry on refusal
+    if "--retry-top-k" in sys.argv:
+        retry_top_k = int(sys.argv[sys.argv.index("--retry-top-k") + 1])
 
-    questions = load_questions(computed_only)
+    questions = load_questions(computed_only, include_holdout)
     sample = stratified_sample(questions, n)
 
     kind = "COMPUTED-ANSWER ONLY" if computed_only else "ALL TYPES"
-    print(f"Pool: {len(questions)} dev questions ({kind}), holdout of {HOLDOUT_SIZE} excluded.")
+    scope = ("all 150, holdout INCLUDED" if include_holdout
+             else f"dev only, holdout of {HOLDOUT_SIZE} excluded")
+    print(f"Pool: {len(questions)} questions ({kind}; {scope}).")
     print(f"Testing {len(sample)}, top_k={top_k}, targeted={targeted}.")
     by_type = defaultdict(int)
     for q in sample:
@@ -190,44 +233,79 @@ def main():
 
     if "--fresh" in sys.argv and RESULTS_PATH.exists():
         RESULTS_PATH.unlink()
-    cached = load_cached_results()
+    generator = AnswerGenerator()
+    # Only reuse answers produced by the same model; older records (e.g. from
+    # the earlier Gemini setup, which carry no "model" field) are ignored.
+    cached = {qid: r for qid, r in load_cached_results().items()
+              if r.get("model") == generator.model}
     if cached:
-        print(f"Resuming: {len(cached)} answers already on disk will be reused.\n")
+        print(f"Resuming: {len(cached)} {generator.model} answers already on disk will be reused.\n")
 
     retriever = Retriever(use_reranker=False)
-    generator = AnswerGenerator()
     print(f"Model: {generator.model}\n")
 
     verdicts = []
     by_type_verdicts: dict[str, list[str]] = defaultdict(list)
     total_in = total_out = 0
-    called_api = 0
+    pacing = {"called": 0, "last_tokens": 0}
+    stopped_early = False
+    escalated = rescued = 0
+
+    def ask(record: dict, k: int) -> tuple[dict, list[dict]]:
+        """Retrieve top-k, generate, and cache the answer immediately."""
+        # Pace by tokens: the per-minute token budget, not request count,
+        # is what the free tier runs out of first.
+        if pacing["called"]:
+            time.sleep(max(REQUEST_SPACING, pacing["last_tokens"] / TOKENS_PER_MINUTE * 60))
+        chunks = retriever.search(
+            record["question"], top_k=k, metadata_filter=True, targeted=targeted
+        )
+        result = generator.generate(record["question"], chunks)
+        pacing["called"] += 1
+        pacing["last_tokens"] = result["input_tokens"] + result["output_tokens"]
+        append_result({
+            "financebench_id": record["financebench_id"],
+            "question_type": record["question_type"],
+            "expected": str(record["answer"]),
+            "retrieved_docs": sorted({c["doc_name"] for c in chunks}),
+            "truth_doc": record["doc_name"],
+            "model": generator.model,
+            "top_k": k,
+            **{key: result[key] for key in
+               ("answer", "citations", "reasoning", "input_tokens", "output_tokens", "latency")},
+        })
+        return result, chunks
 
     for i, record in enumerate(sample, 1):
         qid = record["financebench_id"]
+        hit = cached.get(qid)
+        usable = hit is not None and hit.get("answer") != "ERROR"
+        # A cached refusal from a smaller top_k still deserves the wider retry.
+        retry_due = (usable and retry_top_k > hit.get("top_k", top_k)
+                     and is_refusal(hit["answer"]))
 
-        if qid in cached and cached[qid].get("answer") != "ERROR":
-            result = cached[qid]
-            chunks = []  # not re-retrieved; retrieval detail came from the cached run
-        else:
-            # Free-tier limits are per-minute, so pace requests rather than
-            # firing them back-to-back and spending the run in retry backoff.
-            if called_api:
-                time.sleep(REQUEST_SPACING)
-            chunks = retriever.search(
-                record["question"], top_k=top_k, metadata_filter=True, targeted=targeted
-            )
-            result = generator.generate(record["question"], chunks)
-            called_api += 1
-            append_result({
-                "financebench_id": qid,
-                "question_type": record["question_type"],
-                "expected": str(record["answer"]),
-                "retrieved_docs": sorted({c["doc_name"] for c in chunks}),
-                "truth_doc": record["doc_name"],
-                **{k: result[k] for k in
-                   ("answer", "citations", "reasoning", "input_tokens", "output_tokens", "latency")},
-            })
+        try:
+            if usable and not retry_due:
+                result = hit
+                chunks = []  # not re-retrieved; retrieval detail came from the cached run
+            else:
+                if retry_due:
+                    result, chunks = None, []
+                else:
+                    result, chunks = ask(record, top_k)
+                # Refusal usually means the needed figures were not in the top
+                # few chunks (measured: 31/61 refusals at top_k=5), so retry once
+                # with a wider window before accepting NOT FOUND.
+                if result is None or (is_refusal(result["answer"]) and retry_top_k > top_k):
+                    escalated += 1
+                    result, chunks = ask(record, retry_top_k)
+                    if not is_refusal(result["answer"]):
+                        rescued += 1
+        except DailyLimitReached as exc:
+            print(f"\n{exc}. {i - 1} of {len(sample)} questions processed; "
+                  "rerun the same command later to continue.", flush=True)
+            stopped_early = True
+            break
 
         verdict, note = grade(str(record["answer"]), result["answer"])
         verdicts.append(verdict)
@@ -255,10 +333,13 @@ def main():
     retriever.close()
 
     print("\n" + "=" * 78)
-    print("SUMMARY")
+    print("SUMMARY" + (" (PARTIAL -- daily quota reached)" if stopped_early else ""))
     print("=" * 78)
     counts = {v: verdicts.count(v) for v in ("CORRECT", "WRONG", "REFUSED", "REVIEW", "ERROR")}
     total = len(verdicts)
+    if not total:
+        print("  No questions answered yet.")
+        return
     for verdict, count in counts.items():
         if count:
             print(f"  {verdict:8s} {count:2d}/{total}  ({count/total:.0%})")
@@ -269,6 +350,9 @@ def main():
               f"{counts['CORRECT']}/{auto_graded}  ({counts['CORRECT']/auto_graded:.1%})")
     if counts["REVIEW"]:
         print(f"  {counts['REVIEW']} free-text answer(s) need your judgement (marked REVIEW)")
+    if escalated:
+        print(f"  Fallback: {escalated} NOT FOUND answer(s) at top_k={top_k} retried with "
+              f"top_k={retry_top_k}; {rescued} produced an answer")
 
     print("\n  --- by question type ---")
     for qtype in sorted(by_type_verdicts):

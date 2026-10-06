@@ -1,30 +1,36 @@
 """
-Generates a cited answer from retrieved chunks using Gemini.
+Generates a cited answer from retrieved chunks using an LLM on Groq.
 
-Prompt design is driven by a measured property of this benchmark: 38% of
+Prompt design is driven by a measured property of this benchmark: about half of
 FinanceBench answers do not appear anywhere in their own evidence, because the
 expected value must be calculated (ratios, multi-year averages, year-over-year
 deltas). A naive "answer only from the context" instruction would fail those by
 construction, so the prompt explicitly requires extraction THEN arithmetic.
+
+Default model is openai/gpt-oss-120b: the strongest model on Groq's free tier
+for this key, and a reasoning model, which matters for the arithmetic.
+Free-tier limits (read from response headers): 1000 requests/day and 8000
+tokens/minute -- the per-minute token budget is the binding constraint, so the
+caller paces requests and this class waits out short 429s.
 """
 import os
 import re
 import time
 
 from dotenv import load_dotenv
-from google import genai
+from groq import APIStatusError, Groq, RateLimitError
 
 load_dotenv()
 
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.7-flash")
-# 503 "high demand" is transient on the free tier. The earlier delays
-# (2,5,12,25) exhausted after 44s and lost 20% of answers, so they are longer
-# now and the last attempts also switch model.
-# Tail delays are ~60s because per-minute rate windows need that long to reset.
-RETRY_DELAYS = (2, 5, 15, 30, 60, 65)
-# Attempt index at which to stop asking the congested primary model.
-SWITCH_MODEL_AFTER = 3
+DEFAULT_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+# Reasoning tokens count against the 8000 tokens/minute budget; "medium" is
+# enough for multi-step arithmetic without exhausting a minute on one question.
+REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "medium")
+MAX_COMPLETION_TOKENS = 3000
+# A 429 asking us to wait longer than this is a spent daily quota, not a
+# per-minute window: stop the run (answers are cached) instead of sleeping for hours.
+MAX_RATE_LIMIT_WAIT = 120
+RETRY_DELAYS = (5, 15, 30, 60)  # for transient 5xx errors
 
 PROMPT_TEMPLATE = """You are a financial analyst. Answer the question using the SEC filing excerpts below.
 
@@ -54,38 +60,19 @@ FINAL_ANSWER_RE = re.compile(r"FINAL ANSWER:\s*(.+?)(?:\n|$)", re.IGNORECASE)
 CITATIONS_RE = re.compile(r"CITATIONS:\s*(.+?)(?:\n|$)", re.IGNORECASE)
 
 
+class DailyLimitReached(Exception):
+    """The provider asked us to wait longer than a per-minute window: quota is spent."""
+
+
 class AnswerGenerator:
-    """
-    Holds one or more API keys and rotates to the next when a key's quota is
-    exhausted (429). That is a different failure from 503 "high demand", which
-    is transient capacity on the same key and is handled by waiting instead.
-    """
-
     def __init__(self, model: str | None = None):
-        keys = [
-            key for key in (os.getenv("GEMINI_API_KEY"), os.getenv("GEMINI_API_KEY_2"))
-            if key
-        ]
-        if not keys:
-            raise SystemExit("GEMINI_API_KEY not set. Add it to .env")
-        self.keys = keys
-        self.key_index = 0
-        self.client = genai.Client(api_key=keys[0])
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise SystemExit("GROQ_API_KEY not set. Add it to .env")
+        # SDK-level retries off: rate-limit waits are decided here, where a long
+        # wait can be recognised as a spent daily quota.
+        self.client = Groq(api_key=api_key, max_retries=0)
         self.model = model or DEFAULT_MODEL
-        self.quota_switches = 0
-
-    def _next_key(self) -> None:
-        """
-        Round-robin to the next key. Deliberately wraps rather than dead-ending:
-        a 429 on the free tier is usually a PER-MINUTE limit, not a spent daily
-        quota, so coming back to an earlier key after the retry delay works.
-        Treating the last key's 429 as terminal previously failed 26 of 30
-        questions in a single run.
-        """
-        if len(self.keys) > 1:
-            self.key_index = (self.key_index + 1) % len(self.keys)
-            self.client = genai.Client(api_key=self.keys[self.key_index])
-            self.quota_switches += 1
 
     @staticmethod
     def build_context(chunks: list[dict]) -> str:
@@ -106,7 +93,7 @@ class AnswerGenerator:
         prompt = PROMPT_TEMPLATE.format(
             context=self.build_context(chunks), question=question
         )
-        response, latency = self._call_with_retry(prompt)
+        response, latency, error = self._call_with_retry(prompt)
 
         if response is None:
             return {
@@ -117,61 +104,69 @@ class AnswerGenerator:
                 "latency": latency,
                 "input_tokens": 0,
                 "output_tokens": 0,
-                "error": "all retries exhausted",
+                "error": error,
             }
 
-        text = response.text or ""
-        usage = response.usage_metadata
+        text = response.choices[0].message.content or ""
+        usage = response.usage
         return {
             "answer": self._extract(FINAL_ANSWER_RE, text) or text.strip()[:200],
             "reasoning": self._extract_reasoning(text),
             "citations": self._extract(CITATIONS_RE, text),
             "raw": text,
             "latency": latency,
-            "input_tokens": usage.prompt_token_count or 0,
-            "output_tokens": usage.candidates_token_count or 0,
+            "input_tokens": usage.prompt_tokens if usage else 0,
+            "output_tokens": usage.completion_tokens if usage else 0,
             "error": None,
         }
 
     def _call_with_retry(self, prompt: str):
         start = time.time()
         last_error = None
-        for attempt, delay in enumerate((0, *RETRY_DELAYS)):
-            if delay:
-                time.sleep(delay)
-
-            # After a few failures the primary model is likely congested, so
-            # try the fallback rather than waiting on the same queue.
-            model = self.model if attempt < SWITCH_MODEL_AFTER else FALLBACK_MODEL
+        transient_attempts = 0
+        while True:
             try:
-                response = self.client.models.generate_content(
-                    model=model, contents=prompt
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    reasoning_effort=REASONING_EFFORT,
+                    max_completion_tokens=MAX_COMPLETION_TOKENS,
                 )
-                return response, time.time() - start
-            except Exception as exc:  # noqa: BLE001 -- provider raises varied types
+                return response, time.time() - start, None
+            except RateLimitError as exc:
+                wait = self._retry_after(exc)
+                if wait > MAX_RATE_LIMIT_WAIT:
+                    raise DailyLimitReached(
+                        f"Groq asked to wait {wait:.0f}s -- daily quota reached"
+                    ) from exc
+                print(f"    [rate limited; waiting {wait:.0f}s]", flush=True)
+                time.sleep(wait)
+            except APIStatusError as exc:
                 last_error = exc
-                if self._is_quota_error(exc):
-                    self._next_key()  # try the other key; delays let limits reset
-                    continue
-                if not self._is_retryable(exc):
+                if exc.status_code < 500 or transient_attempts >= len(RETRY_DELAYS):
                     break
+                time.sleep(RETRY_DELAYS[transient_attempts])
+                transient_attempts += 1
+            except Exception as exc:  # noqa: BLE001 -- network errors etc.
+                last_error = exc
+                if transient_attempts >= len(RETRY_DELAYS):
+                    break
+                time.sleep(RETRY_DELAYS[transient_attempts])
+                transient_attempts += 1
 
-        print(f"    [generation failed: {type(last_error).__name__}: {str(last_error)[:90]}]")
-        return None, time.time() - start
+        error = f"{type(last_error).__name__}: {str(last_error)[:150]}"
+        print(f"    [generation failed: {error}]")
+        return None, time.time() - start, error
 
     @staticmethod
-    def _is_quota_error(exc: Exception) -> bool:
-        """Quota exhausted -- a different key may still work."""
-        if getattr(exc, "code", None) == 429:
-            return True
-        return "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc)
-
-    @staticmethod
-    def _is_retryable(exc: Exception) -> bool:
-        """Transient capacity -- the same key will likely work if we wait."""
-        if getattr(exc, "code", None) in (500, 502, 503, 504):
-            return True
-        return any(s in str(exc) for s in ("503", "UNAVAILABLE", "500", "internal"))
+    def _retry_after(exc: RateLimitError) -> float:
+        """Seconds Groq asks us to wait; falls back to a minute if unstated."""
+        headers = exc.response.headers if exc.response is not None else {}
+        try:
+            return float(headers.get("retry-after", 60))
+        except (TypeError, ValueError):
+            return 60.0
 
     @staticmethod
     def _extract(pattern: re.Pattern, text: str) -> str:
