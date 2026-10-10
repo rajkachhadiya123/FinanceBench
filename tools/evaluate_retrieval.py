@@ -379,7 +379,8 @@ def main():
     # Kept out of `enabled`: these choose the model and question set, not
     # pipeline stages. The model is always in the label so a report's name
     # says which index produced it.
-    config["embedding"] = "minilm" if "--minilm" in sys.argv else DEFAULT_EMBEDDING
+    config["embedding"] = ("minilm" if "--minilm" in sys.argv else
+                           "qwen" if "--qwen" in sys.argv else DEFAULT_EMBEDDING)
     config["retrievable_only"] = "--retrievable-only" in sys.argv
     label += f"+{config['embedding']}"
     if config["retrievable_only"]:

@@ -9,7 +9,7 @@ marked *(expected)*.
 |---|---|---|---|
 | [V1](#v1--baseline-all-minilm-l6-v2) | `all-MiniLM-L6-v2` | Done | Baseline. 47% answer-in-top-5 (tune set) |
 | [V2](#v2--bge-base-en-v15) | `BAAI/bge-base-en-v1.5` | Done, **current default** | 53% answer-in-top-5 (tune set); +3 questions, not significant |
-| [V3](#v3--qwen3-embedding-06b-planned) | `Qwen/Qwen3-Embedding-0.6B` + better chunks | **Planned** | — |
+| [V3](#v3--qwen3-embedding-06b-planned) | `Qwen/Qwen3-Embedding-0.6B` + better chunks | **In progress** | Model alone: 61% top-5 on all 71 (BGE 59%); not significant. Chunking next |
 
 ---
 
@@ -235,8 +235,32 @@ flowchart LR
 - Beat V2's **23/43** answer-in-top-5 on the tune set with p < 0.05, then confirm on the 28 holdout.
 - Reduce LLM NOT FOUND answers below the current **30/79**.
 
-### Results
-*To be filled in after the Colab run.*
+### Results — step 1: Qwen3 on the original chunks (model alone)
+Embedded on a Colab T4 ([`tools/colab_embed_qwen.py`](../../tools/colab_embed_qwen.py)) →
+`qwen_vectors.npy` → [`source/INGESTION/embedder3.py`](../../source/INGESTION/embedder3.py) →
+`faiss_qwen.index` (418 MB). Verified: local CPU embeddings of sampled chunks match the
+Colab vectors (cosine ≈ 1.00, rows aligned). Selected with `Retriever(embedding="qwen")`.
+
+Answer in top-k, 71 no-LLM questions, same pipeline (filter + dense + BM25 + RRF):
+
+| Model | Tune 43 @5 | Holdout 28 @5 | **All 71 @5** | All 71 @10 | All 71 @20 | Query time |
+|---|---|---|---|---|---|---|
+| MiniLM (V1) | 20 (47%) | 15 (54%) | 35 (49%) | 48 (68%) | 56 (79%) | 0.21 s |
+| BGE-base (V2) | 23 (53%) | 19 (68%) | 42 (59%) | 48 (68%) | 55 (77%) | 0.24 s |
+| **Qwen3-0.6B (V3)** | **24 (56%)** | 19 (68%) | **43 (61%)** | **51 (72%)** | **58 (82%)** | 1.78 s (CPU) |
+
+Significance (paired McNemar, all 71):
+- Qwen vs BGE: @5 +5/−4 (p = 1.0), @10 +5/−2 (p = 0.45) — **not significant**.
+- Qwen vs MiniLM: @5 +10/−2 (**p = 0.039**) — the only significant model gain so far, but it
+  took two model upgrades to get there.
+
+**Verdict:** Qwen3 is the best of the three by a small margin (mostly at top 10/20), and
+~7× slower per query on CPU. As with V2, **the embedding model is not the bottleneck** —
+three models spanning 22M → 600M parameters land within 8 questions of each other at top 5.
+This supports testing chunking next (step 2 of V3).
+
+### Results — step 2: chunking (context header / structure-aware)
+*To be filled in.*
 
 ---
 

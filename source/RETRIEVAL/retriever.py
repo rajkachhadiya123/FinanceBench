@@ -27,7 +27,10 @@ from sentence_transformers import SentenceTransformer
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))  # so this module also works when run directly
 
-from source.INGESTION import embedder, embedder2  # noqa: E402
+from source.INGESTION import embedder, embedder3  # noqa: E402
+# BGE (V2) retired in favour of Qwen3 (V3). To restore it, uncomment this
+# import and the "bge" entry in EMBEDDINGS below.
+# from source.INGESTION import embedder2  # noqa: E402
 from source.RETRIEVAL.metadata_filter import MetadataFilter  # noqa: E402
 PROCESSED = ROOT / "data" / "PROCESSED"
 CHUNKS_PATH = PROCESSED / "chunks.jsonl"
@@ -39,14 +42,16 @@ BM25_DIR = PROCESSED / "bm25_index"
 # modules rather than retyped here.
 EMBEDDINGS = {
     "minilm": {"model": embedder.MODEL_NAME, "index": embedder.INDEX_PATH, "query_prefix": ""},
-    "bge": {"model": embedder2.MODEL_NAME, "index": embedder2.INDEX_PATH,
-            "query_prefix": embedder2.QUERY_PREFIX},
+    # "bge": {"model": embedder2.MODEL_NAME, "index": embedder2.INDEX_PATH,
+    #         "query_prefix": embedder2.QUERY_PREFIX},
+    "qwen": {"model": embedder3.MODEL_NAME, "index": embedder3.INDEX_PATH,
+             "query_prefix": embedder3.QUERY_PROMPT},
 }
-# BGE vs MiniLM on the 80 questions whose answer is written in the evidence
-# (strict matching -- years not counted as answer values): grounded@5 40 -> 45
-# (fixed 9, broke 4, McNemar p = 0.27). Directionally better, not yet
-# significant. MiniLM kept for comparison.
-DEFAULT_EMBEDDING = "bge"
+# Qwen3-Embedding-0.6B on the 71 no-LLM questions (strict matching): answer in
+# top 5 / 10 / 20 = 43 / 51 / 58, vs BGE 42 / 48 / 55 and MiniLM 35 / 48 / 56.
+# Best of the three, though vs BGE not significant (p = 0.45 at top 10).
+# ~1.8 s per query on CPU (vs 0.24 s for BGE). MiniLM kept for comparison.
+DEFAULT_EMBEDDING = "qwen"
 # Smaller/faster than BAAI/bge-reranker-base, which matters on CPU. Swap if
 # accuracy matters more than latency.
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
