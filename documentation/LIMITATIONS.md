@@ -1,32 +1,62 @@
-# Known Limitations — Baseline (First Attempt)
+# Known Limitations
 
-Honest assessment of the first working end-to-end retrieval pipeline. Nothing here is hypothetical; every item is either measured or a known design decision we made and can name.
+Honest assessment of the retrieval pipeline. Nothing here is hypothetical; every item is either measured or a known design decision we made and can name.
 
 ## Measured Results
 
-| Metric | Result | What it measures |
-|---|---|---|
-| Hit@1 | 8/150 (5.3%) | Labelled evidence page was the top result |
-| Hit@5 | 19/150 (12.7%) | Labelled evidence page appeared in top 5 |
-| MRR | 0.080 | Average of 1/(rank of first correct page) |
-| Answer value present in retrieved text | 90/150 (60.0%) | **Inflated — see L-12** |
-| Correct document retrieved (any page) | 58/150 (38.7%) | Realistic ceiling for answer correctness |
+| Config | Grounded answer | Correct doc | Hit@1 | Hit@3 | Hit@5 | MRR | Latency |
+|---|---|---|---|---|---|---|---|
+| Baseline (BM25 + dense + RRF) | 18.0% | 38.7% | 5.3% | — | 12.7% | 0.080 | 0.03s |
+| **+ metadata filtering** | **46.7%** | **82.0%** | **17.3%** | **28.0%** | **32.7%** | **0.230** | 0.03s |
+| + cross-encoder reranking | 49.3% | 83.3% | 12.7% | 25.3% | 32.0% | 0.197 | 1.82s |
+| *Oracle doc filter (diagnostic)* | *62.0%* | *100%* | *26.0%* | *44.0%* | *49.3%* | *0.353* | *0.03s* |
 
-### Failure breakdown (top 5)
+"Grounded answer" is the primary metric: the expected value found **in the correct document**. The oracle row uses the benchmark's ground-truth document name — data leakage, reported only as a ceiling, never as a result.
+
+### The metric cannot reach 100% — 26.7% of answers must be computed
+
+**38% of questions (57/150) have an answer that does not appear in their own labelled evidence**, because the expected value must be calculated: ratios, multi-year averages, year-over-year deltas. Examples: *"FY2019 fixed asset turnover ratio"* (revenue ÷ average fixed assets), *"FY2017-FY2019 3 year average of capex as a % of revenue"*. No retriever can surface a number that was never written down.
+
+Accounting for figures that are retrievable from a non-labelled page of the correct filing, the true satisfiable set is **110/150 (73.3%)**:
 
 ```
-Right document AND right page :  19/150  (12.7%)
-Right document, WRONG page    :  39/150  (26.0%)
-WRONG document entirely       :  92/150  (61.3%)   ← dominant failure mode
+ 40 (26.7%)  answer exists nowhere retrievable -- pure computation, needs the LLM
+110 (73.3%)  answer IS retrievable  <-- the real ceiling
+ ├─  70      currently found   = 46.7% of all, 63.6% OF ACHIEVABLE
+ └─  40      currently missed
+     ├─ ~23  wrong document (extraction is 82%, not 100%)
+     └─ ~17  right document, wrong chunk
+```
+
+**Report "% of achievable" alongside the raw rate.** Measuring against an unreachable 100% understates retrieval quality by ~17pp and misdirects effort.
+
+**How this was missed initially:** the loose "answer in text" metric read 60-62% across all four configurations — baseline, filtering, reranking and oracle alike. A metric that does not move while the system improves 2.6x is a metric at its ceiling. That signal was printed four times before it was investigated.
+
+### Failure breakdown, current config (metadata filtering)
+
+```
+Right document AND right page :  49/150  (32.7%)
+Right document, WRONG page    :  74/150  (49.3%)   ← now the dominant failure
+WRONG document entirely       :  27/150  (18.0%)
 ```
 
 ---
 
 ## Retrieval
 
-**L-1. No metadata filtering — the single largest flaw.** 61.3% of questions retrieve from the wrong document entirely. The corpus holds 368 filings from only ~40 companies, so each company has ~9 near-identical documents (3M's 2018 and 2021 10-Ks share most of their language, headings, and line items). Semantic similarity cannot separate them because they genuinely *are* near-identical — the distinguishing information is the document's identity, not its prose. Questions name a company and fiscal year; we currently ignore that and search all 107,049 chunks.
+**L-1. ~~No metadata filtering~~ — RESOLVED.** Was the largest flaw at 61.3% wrong-document retrieval. Implemented in `source/RETRIEVAL/metadata_filter.py`: extracts company and fiscal year from the question text (not from the benchmark labels) and restricts search to matching filings, reducing the search space from 360 documents to an average of 2.9. Wrong-document fell 61.3% → 18.0%; grounded answers rose 18.0% → 46.7%.
 
-**L-2. No re-ranking.** Final ordering comes straight from RRF fusion of two first-stage retrievers. A cross-encoder would re-score candidates by reading query and chunk together, which is the standard fix for the 26% "right document, wrong page" bucket.
+Residual gaps: 12/150 questions name no company in their text at all (*"Based on the information provided..."*), and 2/150 have the correct filing excluded because the answer lives in an adjacent year — forward-looking FY2023 guidance appears in the FY2022 Q4 earnings release, not a FY2023 filing.
+
+**L-2. Cross-encoder reranking measured, and not worth enabling.** Implemented and measured; gained only +2.6pp on grounded answers while *degrading* page precision (Hit@1 17.3% → 12.7%, MRR 0.230 → 0.197) and increasing latency 60× (0.03s → 1.82s per query). The cross-encoder optimizes for "does this chunk answer the question," which favours MD&A narrative over the terse financial-statement page the benchmark labels as evidence. Code is retained but disabled by default.
+
+**L-2b. ~~Within-document retrieval is the dominant failure~~ — CORRECTED.** This was diagnosed wrongly. The oracle run's 38% failure rate was read as a retrieval problem, when most of it was the metric asking for values that do not exist in any document (see above). The measured reality:
+
+- Retrieval recall **given the correct document is 81.7%** (76 of the 93 questions whose answer is present in their labelled evidence)
+- Genuine within-document failures: **17 questions (11.3%)**, not 38%
+- 17 further questions were satisfied from a *non-labelled* page of the correct filing, confirming that figures repeat within a filing and that document-scoped scoring is the right choice over page-scoped
+
+The correct priority order follows from the recoverable counts, not from the oracle gap: company/year extraction (~23 questions recoverable, cheap) now outranks the embedding upgrade (~17 questions, ~90 minutes of compute).
 
 **L-3. No query understanding.** Questions are passed through verbatim. No company/year extraction, no rewriting, no decomposition — so multi-part questions ("compare 2018 vs 2022 margins") get one undifferentiated search.
 
@@ -82,10 +112,15 @@ WRONG document entirely       :  92/150  (61.3%)   ← dominant failure mode
 
 ## Priority order for the next iteration
 
-Ranked by measured impact, not by ease:
+Ordered by questions recoverable per unit of effort, after correcting the L-2b misdiagnosis:
 
-1. **L-1 metadata filtering** — addresses 61.3% of failures. Collapses the search space from 107,049 chunks to roughly 300. Requires no re-indexing, so it is simultaneously the highest-impact and cheapest change to test.
-2. **L-12 / L-11 fix the metric** — adopt document-scoped answer presence as the primary metric, so subsequent improvements are measured against something meaningful rather than against an artifact.
-3. **L-5 / L-6 embedding** — eliminate truncation and upgrade the model. Requires re-embedding the full corpus (~70+ minutes).
-4. **L-2 re-ranking** — targets the remaining 26% "right document, wrong page" bucket.
-5. **L-15 dev/holdout split** — should be established *before* extensive tuning, to keep the final numbers honest.
+1. **Company/year extraction coverage (L-1 residual) — ~23 questions, cheap.** Pure query-side logic, no re-indexing. Concrete known cases: 12 questions name no company in their text at all (*"Based on the information provided..."*), and the year heuristic misses filings where the answer sits in an adjacent year — forward-looking FY2023 guidance appears in the FY2022 Q4 earnings release.
+2. **Move to LLM answer generation — 40 questions are blocked on it.** 26.7% of questions require arithmetic over retrieved tables (ratios, averages, deltas). Retrieval is already doing all it can for these; only a model performing the computation can close them. This is a stronger argument for advancing to the next pipeline stage than for further retrieval tuning.
+3. **L-5 / L-6 embedding — ~17 questions, ~90 minutes.** Fix the 256-token truncation (chunks are ~450 tokens, so ~45% of every chunk never reaches its vector) and upgrade to a 512-token model (BGE-base-en-v1.5 or gte-base). Lower priority than previously stated: the recoverable count is 17, not the 57 implied by the earlier misreading.
+4. **L-15 dev/holdout split** — should be established *before* further tuning. Six configurations have now been run against all 150 questions; overfitting risk is accumulating.
+5. **L-8 / L-9 chunking** — revisit alongside item 3, since chunk size must fit the model's input limit. That mismatch is what created L-5.
+
+~~L-1 metadata filtering~~ — done, +28.7pp.
+~~L-12 / L-11 metric fix~~ — done; the old loose metric was inflating results by 3.3×.
+~~L-2 re-ranking~~ — measured and rejected; see L-2 above.
+~~L-2b within-document bottleneck~~ — misdiagnosis, corrected above.
