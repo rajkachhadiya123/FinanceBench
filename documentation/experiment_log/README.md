@@ -9,7 +9,7 @@ marked *(expected)*.
 |---|---|---|---|
 | [V1](#v1--baseline-all-minilm-l6-v2) | `all-MiniLM-L6-v2` | Done | Baseline. 47% answer-in-top-5 (tune set) |
 | [V2](#v2--bge-base-en-v15) | `BAAI/bge-base-en-v1.5` | Done, **current default** | 53% answer-in-top-5 (tune set); +3 questions, not significant |
-| [V3](#v3--qwen3-embedding-06b-planned) | `Qwen/Qwen3-Embedding-0.6B` + better chunks | **In progress** | Model alone: 61% top-5 on all 71 (BGE 59%); not significant. Chunking next |
+| [V3](#v3--qwen3-embedding-06b-planned) | `Qwen/Qwen3-Embedding-0.6B` + better chunks | **In progress** | Qwen alone: 61% top-5 (BGE 59%, n.s.). **+ Cohere rerank-v4.0-pro: 82% top-5 (p < 0.001)**. Chunking next |
 
 ---
 
@@ -259,7 +259,39 @@ Significance (paired McNemar, all 71):
 three models spanning 22M → 600M parameters land within 8 questions of each other at top 5.
 This supports testing chunking next (step 2 of V3).
 
-### Results — step 2: chunking (context header / structure-aware)
+### Results — step 2: Cohere reranker on top of Qwen hybrid search
+Pipeline: filter → Qwen top 20 + BM25 top 20 → RRF (up to 40 candidates) →
+**Cohere `rerank-v4.0-pro`** (hosted API, free trial key) → top k.
+Code: [`source/RETRIEVAL/cohere_reranker.py`](../../source/RETRIEVAL/cohere_reranker.py),
+`Retriever(use_reranker="cohere")` + `search(..., rerank=True)`;
+measured with [`tools/evaluate_reranker.py`](../../tools/evaluate_reranker.py).
+
+Answer in top k, 71 no-LLM questions:
+
+| Configuration | @1 | @3 | **@5** | @10 | MRR |
+|---|---|---|---|---|---|
+| Qwen hybrid, no rerank | 22 (31%) | 34 (48%) | 43 (61%) | 51 (72%) | 0.433 |
+| + rerank top 20 | 38 (54%) | 50 (70%) | 54 (76%) | 57 (80%) | 0.633 |
+| **+ rerank top 40** | **40 (56%)** | **54 (76%)** | **58 (82%)** | **61 (86%)** | **0.674** |
+
+| Split (rerank top 40) | @5 | MRR |
+|---|---|---|
+| Tune 43 | 33 (77%) — was 24 (56%) | 0.613 |
+| Holdout 28 | **25 (89%)** — was 19 (68%) | 0.768 |
+
+Significance vs no rerank (McNemar): top 40 @5 **+16 / −1, p < 0.001**; @1 +24 / −6, p = 0.001.
+**The first large, significant gain since the metadata filter.** Holds on the untouched holdout.
+
+By type @5 (no rerank → top 40): domain 17 → 24 / 27, metrics 9 → 12 / 13, novel 17 → 22 / 31.
+
+Cost: ~0.9 s per question (API), one call per question. Trial key: 10 calls/min, 1,000/month.
+
+**Why it works:** the first-stage searches score question and chunk separately; the
+cross-encoder reads them together, so it fixes the "right chunk ranked 6–40" cases (the
+35% of misses identified in V2). It cannot fix chunks never retrieved — remaining misses
+are the target for chunking (step 3).
+
+### Results — step 3: chunking (context header / structure-aware)
 *To be filled in.*
 
 ---

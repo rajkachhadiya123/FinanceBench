@@ -32,7 +32,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from source.GENERATION.answer_generator import AnswerGenerator, DailyLimitReached  # noqa: E402
+from source.GENERATION.answer_generator import (  # noqa: E402
+    PROMPT_VERSION,
+    REASONING_EFFORT,
+    AnswerGenerator,
+    DailyLimitReached,
+)
 from source.RETRIEVAL.retriever import Retriever  # noqa: E402
 from tools.evaluate_retrieval import (  # noqa: E402
     KEYWORD_PASS_RATIO,
@@ -47,10 +52,18 @@ QUESTIONS_PATH = ROOT / "data" / "EVAL" / "financebench_open_source.jsonl"
 # discarding completed answers the expensive mistake.
 RESULTS_PATH = ROOT / "data" / "PROCESSED" / "answer_results.jsonl"
 DEFAULT_TOP_K = 5
-REQUEST_SPACING = 5  # minimum seconds between questions
-# Groq free tier: 8000 tokens/minute. After each call, wait long enough that the
-# tokens it used fit inside the per-minute budget, instead of hitting 429s.
-TOKENS_PER_MINUTE = 8000
+# Cerebras gpt-oss-120b: 5 requests/min and 30,000 tokens/min. Space calls 12 s
+# apart, and longer if the last call used enough tokens to need it. (Groq's
+# free tier was 8,000 tokens/min with 5 s spacing.) 12 s also keeps the Cohere
+# reranker under its trial limit of 10 calls/min.
+REQUEST_SPACING = 12
+TOKENS_PER_MINUTE = 30000
+# Retrieval used for every answer: Qwen dense + BM25 -> RRF -> Cohere rerank.
+# --embedding qwen_headed uses the chunks with context headers; its answers are
+# cached under their own label, so they never mix with the "qwen" answers.
+RERANKER = "cohere"
+EMBEDDING = sys.argv[sys.argv.index("--embedding") + 1] if "--embedding" in sys.argv else "qwen"
+RETRIEVAL_LABEL = f"{EMBEDDING}+bm25+cohere-rerank"
 RETRY_TOP_K = 10  # on a NOT FOUND, ask again once with this many chunks
 
 
@@ -219,6 +232,12 @@ def main():
         retry_top_k = int(sys.argv[sys.argv.index("--retry-top-k") + 1])
 
     questions = load_questions(computed_only, include_holdout)
+    if "--ids" in sys.argv:
+        # Re-test a chosen subset, e.g. the questions a previous run got wrong:
+        # --ids path/to/ids.txt (one financebench_id per line).
+        ids_path = Path(sys.argv[sys.argv.index("--ids") + 1])
+        wanted = {line.strip() for line in ids_path.read_text().splitlines() if line.strip()}
+        questions = [q for q in questions if q["financebench_id"] in wanted]
     sample = stratified_sample(questions, n)
 
     kind = "COMPUTED-ANSWER ONLY" if computed_only else "ALL TYPES"
@@ -236,13 +255,19 @@ def main():
     generator = AnswerGenerator()
     # Only reuse answers produced by the same model; older records (e.g. from
     # the earlier Gemini setup, which carry no "model" field) are ignored.
+    # Reuse an answer only if the same model, retrieval, prompt and reasoning
+    # effort produced it. Records from before the "prompt" field existed used
+    # prompt v1; before "reasoning_effort" existed, effort was "medium".
     cached = {qid: r for qid, r in load_cached_results().items()
-              if r.get("model") == generator.model}
+              if r.get("model") == generator.model
+              and r.get("retrieval") == RETRIEVAL_LABEL
+              and r.get("prompt", "v1") == PROMPT_VERSION
+              and r.get("reasoning_effort", "medium") == REASONING_EFFORT}
     if cached:
         print(f"Resuming: {len(cached)} {generator.model} answers already on disk will be reused.\n")
 
-    retriever = Retriever(use_reranker=False)
-    print(f"Model: {generator.model}\n")
+    retriever = Retriever(use_reranker=RERANKER, embedding=EMBEDDING)
+    print(f"Model: {generator.model} | retrieval: {RETRIEVAL_LABEL}\n")
 
     verdicts = []
     by_type_verdicts: dict[str, list[str]] = defaultdict(list)
@@ -258,7 +283,8 @@ def main():
         if pacing["called"]:
             time.sleep(max(REQUEST_SPACING, pacing["last_tokens"] / TOKENS_PER_MINUTE * 60))
         chunks = retriever.search(
-            record["question"], top_k=k, metadata_filter=True, targeted=targeted
+            record["question"], top_k=k, metadata_filter=True, targeted=targeted,
+            rerank=True,
         )
         result = generator.generate(record["question"], chunks)
         pacing["called"] += 1
@@ -270,9 +296,13 @@ def main():
             "retrieved_docs": sorted({c["doc_name"] for c in chunks}),
             "truth_doc": record["doc_name"],
             "model": generator.model,
+            "retrieval": RETRIEVAL_LABEL,
+            "prompt": PROMPT_VERSION,
+            "reasoning_effort": REASONING_EFFORT,
             "top_k": k,
-            **{key: result[key] for key in
-               ("answer", "citations", "reasoning", "input_tokens", "output_tokens", "latency")},
+            **{key: result.get(key, "") for key in
+               ("answer", "citations", "reasoning", "formula", "calc_check",
+                "input_tokens", "output_tokens", "latency")},
         })
         return result, chunks
 
@@ -324,6 +354,8 @@ def main():
         print(f"  EXPECTED : {safe(str(record['answer']))[:300]}")
         print(f"  GENERATED: {safe(result['answer'])[:300]}")
         print(f"  CITED    : {safe(result.get('citations', ''))[:120]}")
+        if result.get("formula") and result["formula"].lower() != "none":
+            print(f"  FORMULA  : {safe(result['formula'])[:160]}  [check: {result.get('calc_check')}]")
         print(f"  RETRIEVED: {', '.join(retrieved)}")
         print(f"  TRUTH DOC: {record['doc_name']}")
         print(f"  VERDICT  : {verdict}" + (f"  ({note})" if note else ""))

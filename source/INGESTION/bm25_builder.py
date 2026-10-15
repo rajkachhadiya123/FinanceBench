@@ -10,8 +10,12 @@ sparse matrices instead of Python lists, which keeps memory usage viable for
 
 Streams chunks.jsonl in file order, matching embedder.py, so BM25 document N
 and FAISS vector N refer to the same chunk.
+
+    python source/INGESTION/bm25_builder.py            # chunks.jsonl        -> bm25_index/
+    python source/INGESTION/bm25_builder.py --headed   # chunks_headed.jsonl -> bm25_index_headed/
 """
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -21,6 +25,8 @@ import Stemmer
 ROOT = Path(__file__).resolve().parents[2]
 CHUNKS_PATH = ROOT / "data" / "PROCESSED" / "chunks.jsonl"
 BM25_DIR = ROOT / "data" / "PROCESSED" / "bm25_index"
+HEADED_CHUNKS_PATH = ROOT / "data" / "PROCESSED" / "chunks_headed.jsonl"
+HEADED_BM25_DIR = ROOT / "data" / "PROCESSED" / "bm25_index_headed"
 
 
 def load_chunk_texts(path: Path) -> list[str]:
@@ -32,13 +38,15 @@ def load_chunk_texts(path: Path) -> list[str]:
 
 
 def main():
-    if not CHUNKS_PATH.exists():
-        raise SystemExit(f"Missing {CHUNKS_PATH}. Run chunker.py first.")
+    headed = "--headed" in sys.argv
+    chunks_path, bm25_dir = (HEADED_CHUNKS_PATH, HEADED_BM25_DIR) if headed else (CHUNKS_PATH, BM25_DIR)
+    if not chunks_path.exists():
+        raise SystemExit(f"Missing {chunks_path}. Run chunker.py (or tools/add_chunk_headers.py) first.")
 
     start_time = time.time()
 
-    print(f"Reading chunk texts from {CHUNKS_PATH.name} ...")
-    texts = load_chunk_texts(CHUNKS_PATH)
+    print(f"Reading chunk texts from {chunks_path.name} ...")
+    texts = load_chunk_texts(chunks_path)
     print(f"  {len(texts)} chunks loaded ({time.time() - start_time:.0f}s)")
 
     # Stemming collapses "reported"/"reporting"/"reports" to one term, so a
@@ -53,10 +61,10 @@ def main():
     retriever = bm25s.BM25()
     retriever.index(token_ids, show_progress=True)
 
-    BM25_DIR.mkdir(parents=True, exist_ok=True)
-    retriever.save(str(BM25_DIR))
+    bm25_dir.mkdir(parents=True, exist_ok=True)
+    retriever.save(str(bm25_dir))
 
-    print(f"\nBM25 index written to {BM25_DIR}")
+    print(f"\nBM25 index written to {bm25_dir}")
     print(f"Total time: {time.time() - start_time:.0f}s")
 
 

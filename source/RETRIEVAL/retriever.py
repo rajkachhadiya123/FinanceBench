@@ -39,13 +39,20 @@ BM25_DIR = PROCESSED / "bm25_index"
 
 # Each dense index must be queried with the exact model (and query prefix) that
 # built it, or the scores are meaningless -- so both are read from the builder
-# modules rather than retyped here.
+# modules rather than retyped here. An entry may also name its own chunk text,
+# metadata and BM25 index (default: CHUNKS_PATH / META_PATH / BM25_DIR), so a
+# variant built on different chunk text keeps all four in step.
 EMBEDDINGS = {
     "minilm": {"model": embedder.MODEL_NAME, "index": embedder.INDEX_PATH, "query_prefix": ""},
     # "bge": {"model": embedder2.MODEL_NAME, "index": embedder2.INDEX_PATH,
     #         "query_prefix": embedder2.QUERY_PREFIX},
     "qwen": {"model": embedder3.MODEL_NAME, "index": embedder3.INDEX_PATH,
              "query_prefix": embedder3.QUERY_PROMPT},
+    # Same chunks, each prefixed with a context header (tools/add_chunk_headers.py).
+    "qwen_headed": {"model": embedder3.MODEL_NAME, "index": embedder3.HEADED_INDEX_PATH,
+                    "query_prefix": embedder3.QUERY_PROMPT,
+                    "chunks": embedder3.HEADED_CHUNKS_PATH, "meta": embedder3.HEADED_META_PATH,
+                    "bm25": PROCESSED / "bm25_index_headed"},
 }
 # Qwen3-Embedding-0.6B on the 71 no-LLM questions (strict matching): answer in
 # top 5 / 10 / 20 = 43 / 51 / 58, vs BGE 42 / 48 / 55 and MiniLM 35 / 48 / 56.
@@ -80,12 +87,17 @@ STATEMENT_HINTS = {
     ),
 }
 # Fusion can yield up to 2x CANDIDATES_K unique chunks; cap what the
-# cross-encoder scores, since it runs on CPU and cannot be precomputed.
-RERANK_CANDIDATES = 20
+# cross-encoder scores. The local model runs on CPU, so it gets fewer; the
+# Cohere API scores the whole fused list in one call at no extra cost.
+RERANK_CANDIDATES = {"local": 20, "cohere": 40}
 
 
 class Retriever:
-    def __init__(self, use_reranker: bool = False, embedding: str = DEFAULT_EMBEDDING):
+    def __init__(self, use_reranker: bool | str = False, embedding: str = DEFAULT_EMBEDDING):
+        """
+        use_reranker: False = none; True or "local" = CPU cross-encoder
+        (RERANK_MODEL); "cohere" = Cohere Rerank API (COHERE_API_KEY in .env).
+        """
         if embedding not in EMBEDDINGS:
             raise ValueError(f"Unknown embedding {embedding!r}; choose from {list(EMBEDDINGS)}")
         spec = EMBEDDINGS[embedding]
@@ -93,11 +105,12 @@ class Retriever:
         self.embedder = SentenceTransformer(spec["model"])
         self.query_prefix = spec["query_prefix"]
         self.stemmer = Stemmer.Stemmer("english")
+        self.embedding = embedding
         self.faiss_index = faiss.read_index(str(spec["index"]))
-        self.bm25 = bm25s.BM25.load(str(BM25_DIR), mmap=True)
-        self.meta = self._load_meta()
+        self.bm25 = bm25s.BM25.load(str(spec.get("bm25", BM25_DIR)), mmap=True)
+        self.meta = self._load_meta(spec.get("meta", META_PATH))
 
-        self._chunks_file = open(CHUNKS_PATH, "rb")  # kept open for seek-reads
+        self._chunks_file = open(spec.get("chunks", CHUNKS_PATH), "rb")  # kept open for seek-reads
 
         self.positions_by_doc: dict[str, list[int]] = {}
         for position, meta in enumerate(self.meta):
@@ -107,11 +120,19 @@ class Retriever:
         self._mask_buffer = np.zeros(len(self.meta), dtype=np.float32)
 
         self.reranker = None
-        if use_reranker:
+        self.reranker_kind = None
+        if use_reranker == "cohere":
+            from source.RETRIEVAL.cohere_reranker import CohereReranker
+
+            self.reranker = CohereReranker()
+            self.reranker_kind = "cohere"
+            print(f"Reranker: Cohere {self.reranker.model}")
+        elif use_reranker:
             from sentence_transformers import CrossEncoder
 
             print(f"Loading reranker: {RERANK_MODEL}")
             self.reranker = CrossEncoder(RERANK_MODEL)
+            self.reranker_kind = "local"
 
         if self.faiss_index.ntotal != len(self.meta):
             raise RuntimeError(
@@ -121,8 +142,8 @@ class Retriever:
         print(f"Ready: {len(self.meta)} chunks indexed.")
 
     @staticmethod
-    def _load_meta() -> list[dict]:
-        with open(META_PATH, "rb") as f:
+    def _load_meta(path: Path) -> list[dict]:
+        with open(path, "rb") as f:
             return [json.loads(line) for line in f]
 
     def search(
@@ -267,11 +288,16 @@ class Retriever:
         reads up to 512 tokens -- so it is not subject to the 256-token
         truncation that limits our stored vectors.
         """
-        candidates = positions[:RERANK_CANDIDATES]
-        rest = positions[RERANK_CANDIDATES:]
+        limit = RERANK_CANDIDATES[self.reranker_kind]
+        candidates = positions[:limit]
+        rest = positions[limit:]
 
-        pairs = [(query, self._rerank_document(p)) for p in candidates]
-        scores = self.reranker.predict(pairs, show_progress_bar=False)
+        documents = [self._rerank_document(p) for p in candidates]
+        if self.reranker_kind == "cohere":
+            scores = self.reranker.score(query, documents)
+        else:
+            scores = self.reranker.predict([(query, d) for d in documents],
+                                           show_progress_bar=False)
         order = np.argsort(scores)[::-1]
         return [candidates[i] for i in order] + rest
 
@@ -310,6 +336,8 @@ class Retriever:
 
     def close(self):
         self._chunks_file.close()
+        if self.reranker_kind == "cohere":
+            self.reranker.close()
 
 
 def main():
