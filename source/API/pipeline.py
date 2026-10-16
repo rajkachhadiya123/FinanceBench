@@ -22,6 +22,7 @@ from source.GENERATION.answer_generator import (
     REASONING_EFFORT,
     AnswerGenerator,
 )
+from source.GUARDRAILS.guards import GUARDRAILS_VERSION, check_output
 from source.RETRIEVAL.retriever import Retriever
 
 
@@ -58,7 +59,7 @@ class QAPipeline:
         reranker = getattr(self.retriever.reranker, "model", config.reranker)
         self.version = (f"{config.embedding}+bm25+{reranker}|{self.generator.model}"
                         f"|prompt-{PROMPT_VERSION}|{REASONING_EFFORT}"
-                        f"|k{config.top_k}/{config.retry_top_k}")
+                        f"|k{config.top_k}/{config.retry_top_k}|guards-{GUARDRAILS_VERSION}")
 
     @property
     def chunks_indexed(self) -> int:
@@ -86,13 +87,19 @@ class QAPipeline:
                 result = self.generator.generate(question, used)
         if result["answer"] == "ERROR":
             raise GenerationFailed(result.get("error") or "LLM call failed")
+        chunks_out = [public_chunk(c) for c in used]
+        not_found = is_not_found(result["answer"])
         return {
             "answer": result["answer"],
-            "not_found": is_not_found(result["answer"]),
+            "not_found": not_found,
             "reasoning": result.get("reasoning", ""),
             "citations": result.get("citations", ""),
             "retried_with_more_chunks": retried,
-            "chunks": [public_chunk(c) for c in used],
+            "chunks": chunks_out,
+            # Signals only -- computed on chunk text without its header, so a header's
+            # page number can never count as evidence for a figure.
+            "output_checks": check_output(result["answer"], result.get("reasoning", ""),
+                                          chunks_out, not_found),
             "tokens": {"input": result.get("input_tokens", 0), "output": result.get("output_tokens", 0)},
         }
 
@@ -112,4 +119,5 @@ def public_chunk(chunk: dict) -> dict:
         "page_end": chunk["page_end"],
         "header": header,
         "text": text,
+        "rerank_score": chunk.get("rerank_score"),
     }

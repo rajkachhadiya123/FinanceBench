@@ -122,9 +122,19 @@ Order agreed with the user; each step on its own branch + PR:
    The fallback slices one reranked top-10 list, so it costs no second Cohere call.
    `requirements.txt` added (pinned). No Redis / Supabase: single process, static
    indexes — swap the cache class for Redis only when running several workers.
-3. **Guardrails**: input (off-topic, prompt injection, no company identified) and output
-   (answer numbers present in retrieved text, NOT FOUND/low-confidence flag, "not
-   investment advice" note). `source/GUARDRAILS/` is empty.
+3. ✅ **Guardrails** (`feat/guardrails`), rule-based, no LLM — `source/GUARDRAILS/`:
+   `guards.py` (input: hidden chars, unreadable text, repeated chars/words, narrow
+   prompt-injection regexes → HTTP 400; output signals only, answer never changed:
+   figure grounding vs retrieved text, Cohere `retrieval_confidence` / `low_confidence`
+   < 0.50, investment-advice disclaimer; no-company warning) and `rate_limit.py`
+   (per-client sliding window, 10 /query + 30 /retrieve per min, env-configurable → 429).
+   Retriever results now carry `rerank_score`. Validated by `tools/evaluate_guardrails.py`:
+   0/150 benchmark questions blocked, 14/14 attacks blocked, 10/10 tricky legit questions
+   passed; grounding flag 0/111 false alarms (threshold 0.35, page refs excluded) but it
+   also flags 0/19 wrong answers — wrong answers use real figures from the wrong row, so
+   it only catches invented numbers; confidence: every answered benchmark question ≥ 0.816,
+   out-of-scope questions 0.28–0.39. Observation: for "is X a good investment" the LLM
+   still answers Yes/No — the disclaimer is attached, the prompt was not changed.
 4. **Tracing**: per-request latency per step, tokens, cost, retrieved chunk ids
    (Langfuse or JSON logs). `source/TRACING/` is empty.
 5. **Deployment**: Dockerfile + docker-compose; mount `data/PROCESSED/` (~2 GB) rather

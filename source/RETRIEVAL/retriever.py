@@ -180,12 +180,18 @@ class Retriever:
         if dedup:
             fused = self._drop_overlapping(fused)
 
+        scores: dict[int, float] = {}
         if rerank:
             if self.reranker is None:
                 raise RuntimeError("Retriever was built with use_reranker=False.")
-            fused = self._rerank(query, fused, top_k)
+            fused, scores = self._rerank(query, fused, top_k)
 
-        return [self._build_result(pos, rank) for rank, pos in enumerate(fused[:top_k], 1)]
+        results = [self._build_result(pos, rank) for rank, pos in enumerate(fused[:top_k], 1)]
+        for result in results:
+            # Cohere relevance in [0, 1] (raw logit for the local cross-encoder);
+            # None for candidates beyond the rerank limit or when not reranked.
+            result["rerank_score"] = scores.get(result["position"])
+        return results
 
     @staticmethod
     def _statement_queries(query: str) -> list[str]:
@@ -280,7 +286,7 @@ class Retriever:
     def _chunk_index(chunk_id: str) -> int:
         return int(chunk_id.rsplit("__", 1)[1])
 
-    def _rerank(self, query: str, positions: list[int], top_k: int) -> list[int]:
+    def _rerank(self, query: str, positions: list[int], top_k: int) -> tuple[list[int], dict[int, float]]:
         """
         Re-score candidates by reading query and chunk text together.
 
@@ -299,7 +305,8 @@ class Retriever:
             scores = self.reranker.predict([(query, d) for d in documents],
                                            show_progress_bar=False)
         order = np.argsort(scores)[::-1]
-        return [candidates[i] for i in order] + rest
+        by_position = {candidates[i]: float(scores[i]) for i in range(len(candidates))}
+        return [candidates[i] for i in order] + rest, by_position
 
     def _rerank_document(self, position: int) -> str:
         """

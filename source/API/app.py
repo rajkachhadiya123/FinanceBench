@@ -13,22 +13,35 @@ Then open http://127.0.0.1:8000/docs for interactive documentation.
 Startup loads the Qwen model, the FAISS and BM25 indexes and the API clients once
 (~30-60 s on CPU); the server accepts requests only after that. Answers are cached
 in SQLite (data/PROCESSED/cache.db, or FILINGLENS_CACHE_PATH), keyed by the pipeline
-version, so changing the model, prompt or index never serves a stale answer.
+version, so changing the model, prompt, index or guardrails never serves a stale answer.
+
+Guardrails (source/GUARDRAILS/), in request order:
+    1. rate limit per client      -> 429 with Retry-After
+    2. input check                -> 400 only for clear abuse (hidden characters,
+                                     unreadable text, prompt injection)
+    3. cache / pipeline
+    4. "guardrails" in the response: warnings, output checks, disclaimer --
+       signals only; the answer is never changed
 """
+import math
 import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from source.API.pipeline import GenerationFailed, QAPipeline
 from source.GENERATION.answer_generator import PROMPT_VERSION, DailyLimitReached
+from source.GUARDRAILS.guards import DISCLAIMER, check_input, needs_disclaimer
+from source.GUARDRAILS.rate_limit import RateLimiter
 from source.SHARED.cache import AnswerCache
 
 ROOT = Path(__file__).resolve().parents[2]
 CACHE_PATH = Path(os.getenv("FILINGLENS_CACHE_PATH", ROOT / "data" / "PROCESSED" / "cache.db"))
+NO_COMPANY_WARNING = ("No company was recognised in the question, so all filings were "
+                      "searched; naming the company and fiscal year gives more reliable answers.")
 
 state: dict = {}
 
@@ -36,6 +49,7 @@ state: dict = {}
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     state["cache"] = AnswerCache(CACHE_PATH)
+    state["limiter"] = RateLimiter()
     state["pipeline"] = QAPipeline()
     yield
     state["pipeline"].close()
@@ -44,7 +58,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="FilingLens API",
-    version="1.0.0",
+    version="1.1.0",
     description="Question answering over SEC filings (FinanceBench: 79.3% end-to-end).",
     lifespan=lifespan,
 )
@@ -71,6 +85,24 @@ class Chunk(BaseModel):
     page_end: int
     header: str | None = Field(None, description="[COMPANY | TYPE | PERIOD | page | section]")
     text: str
+    rerank_score: float | None = Field(None, description="Cohere relevance 0-1; null if not reranked")
+
+
+class OutputChecks(BaseModel):
+    grounded: bool | None = Field(
+        None, description="At least half of the answer's figures appear in the retrieved text; "
+                          "null if the answer has no figures or is NOT FOUND")
+    grounding_ratio: float | None
+    figures_checked: int
+    ungrounded_figures: list[float]
+    retrieval_confidence: float | None = Field(None, description="Best rerank score among chunks used")
+    low_confidence: bool
+
+
+class Guardrails(BaseModel):
+    warnings: list[str]
+    output: OutputChecks | None = None
+    disclaimer: str | None = None
 
 
 class QueryResponse(BaseModel):
@@ -83,6 +115,7 @@ class QueryResponse(BaseModel):
     filings_searched: list[str] | None = Field(
         None, description="Filings kept by the metadata filter; null = no company recognised, all searched")
     chunks: list[Chunk]
+    guardrails: Guardrails
     cached: bool
     latency_ms: int
     pipeline_version: str
@@ -92,6 +125,7 @@ class RetrieveResponse(BaseModel):
     question: str
     filings_searched: list[str] | None
     chunks: list[Chunk]
+    guardrails: Guardrails
     cached: bool
     latency_ms: int
     pipeline_version: str
@@ -102,8 +136,27 @@ class HealthResponse(BaseModel):
     chunks_indexed: int
     pipeline_version: str
     prompt_version: str
+    rate_limits_per_minute: dict
     cache_path: str
     cache: dict
+
+
+# --- guard helpers ----------------------------------------------------------------
+def guard_request(request: Request, group: str, question: str) -> None:
+    """Rate limit, then input check; raises before any cache lookup or API call."""
+    client = request.client.host if request.client else "unknown"
+    wait = state["limiter"].check(client, group)
+    if wait:
+        raise HTTPException(429, f"Rate limit: {state['limiter'].limits[group]} {group} "
+                                 f"requests per minute.",
+                            headers={"Retry-After": str(math.ceil(wait))})
+    verdict = check_input(question)
+    if verdict["blocked"]:
+        raise HTTPException(400, {"guardrail": "input", "reason": verdict["reason"]})
+
+
+def warnings_for(filings: list[str] | None) -> list[str]:
+    return [NO_COMPANY_WARNING] if filings is None else []
 
 
 # --- endpoints ------------------------------------------------------------------
@@ -111,7 +164,8 @@ class HealthResponse(BaseModel):
 # block the server's event loop.
 
 @app.post("/query", response_model=QueryResponse)
-def query(req: QueryRequest) -> QueryResponse:
+def query(req: QueryRequest, request: Request) -> QueryResponse:
+    guard_request(request, "query", req.question)
     pipeline: QAPipeline = state["pipeline"]
     cache: AnswerCache = state["cache"]
     start = time.perf_counter()
@@ -129,15 +183,21 @@ def query(req: QueryRequest) -> QueryResponse:
     else:
         body = hit
 
+    guardrails = Guardrails(
+        warnings=warnings_for(body["filings_searched"]),
+        output=OutputChecks(**body["output_checks"]),
+        disclaimer=DISCLAIMER if needs_disclaimer(req.question) else None,
+    )
     return QueryResponse(
         question=req.question, cached=hit is not None, pipeline_version=pipeline.version,
-        latency_ms=round((time.perf_counter() - start) * 1000),
-        **{k: v for k, v in body.items() if k != "tokens"},
+        latency_ms=round((time.perf_counter() - start) * 1000), guardrails=guardrails,
+        **{k: v for k, v in body.items() if k not in ("tokens", "output_checks")},
     )
 
 
 @app.post("/retrieve", response_model=RetrieveResponse)
-def retrieve(req: RetrieveRequest) -> RetrieveResponse:
+def retrieve(req: RetrieveRequest, request: Request) -> RetrieveResponse:
+    guard_request(request, "retrieve", req.question)
     pipeline: QAPipeline = state["pipeline"]
     cache: AnswerCache = state["cache"]
     params = f"k={req.top_k}|rerank={req.rerank}"
@@ -153,7 +213,8 @@ def retrieve(req: RetrieveRequest) -> RetrieveResponse:
 
     return RetrieveResponse(
         question=req.question, cached=hit is not None, pipeline_version=pipeline.version,
-        latency_ms=round((time.perf_counter() - start) * 1000), **body,
+        latency_ms=round((time.perf_counter() - start) * 1000),
+        guardrails=Guardrails(warnings=warnings_for(body["filings_searched"])), **body,
     )
 
 
@@ -162,7 +223,8 @@ def health() -> HealthResponse:
     pipeline: QAPipeline = state["pipeline"]
     return HealthResponse(
         status="ok", chunks_indexed=pipeline.chunks_indexed, pipeline_version=pipeline.version,
-        prompt_version=PROMPT_VERSION, cache_path=str(CACHE_PATH), cache=state["cache"].stats(),
+        prompt_version=PROMPT_VERSION, rate_limits_per_minute=state["limiter"].limits,
+        cache_path=str(CACHE_PATH), cache=state["cache"].stats(),
     )
 
 
