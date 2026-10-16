@@ -1,0 +1,26 @@
+# FilingLens — pinned to the versions the 79.3% pipeline and the API were run with.
+# Install: python -m pip install -r requirements.txt
+
+# API
+fastapi==0.143.2
+uvicorn==0.54.0
+pydantic==2.13.5
+
+# Retrieval
+sentence-transformers==6.1.0   # Qwen3-Embedding-0.6B query embeddings
+transformers==5.17.0
+torch==2.14.0
+faiss-cpu==1.15.1
+bm25s==0.3.11
+PyStemmer==3.1.0
+numpy==2.2.6
+
+# Generation + reranking (Cerebras and Cohere over plain HTTP)
+httpx==0.28.1
+python-dotenv==1.2.3
+
+# Ingestion (only needed to rebuild chunks from the PDFs)
+pymupdf==1.28.2
+
+# Optional: tools/evaluate_retrieval.py writes PDF reports with reportlab
+# reportlab

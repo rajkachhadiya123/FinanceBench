@@ -113,9 +113,15 @@ files were deleted after verifying the FAISS indexes hold identical vectors
 ## 8. ▶ NEXT STEPS — engineering (accuracy work is closed)
 Order agreed with the user; each step on its own branch + PR:
 1. ✅ **Docs** (`docs/v3-results`): experiment log, LIMITATIONS.md, this file.
-2. **API** (`feat/api`): FastAPI — `POST /query` → answer, citations, retrieved chunks,
-   NOT FOUND flag; `GET /health`. Load Qwen, indexes, Cohere and Cerebras clients once at
-   startup. Use the final pipeline (§2) with `embedding="qwen_headed"`.
+2. ✅ **API** (`feat/api`): `source/API/app.py` (FastAPI) + `source/API/pipeline.py`
+   (final pipeline, loaded once, calls serialized by a lock) + `source/SHARED/cache.py`
+   (SQLite answer cache, `data/PROCESSED/cache.db`, exact-match keys incl. pipeline
+   version). Endpoints: `POST /query`, `POST /retrieve` (no LLM; `rerank` optional),
+   `GET /health`, `DELETE /cache`. Run: `python -m uvicorn source.API.app:app --port 8000`,
+   docs at `/docs`. Tested: 3M FY2018 capex → $1,577M (correct) in 3.7 s, 3 ms cached.
+   The fallback slices one reranked top-10 list, so it costs no second Cohere call.
+   `requirements.txt` added (pinned). No Redis / Supabase: single process, static
+   indexes — swap the cache class for Redis only when running several workers.
 3. **Guardrails**: input (off-topic, prompt injection, no company identified) and output
    (answer numbers present in retrieved text, NOT FOUND/low-confidence flag, "not
    investment advice" note). `source/GUARDRAILS/` is empty.
