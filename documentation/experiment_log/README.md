@@ -8,8 +8,13 @@ marked *(expected)*.
 | Version | Embedding model | Status | Headline result |
 |---|---|---|---|
 | [V1](#v1--baseline-all-minilm-l6-v2) | `all-MiniLM-L6-v2` | Done | Baseline. 47% answer-in-top-5 (tune set) |
-| [V2](#v2--bge-base-en-v15) | `BAAI/bge-base-en-v1.5` | Done, **current default** | 53% answer-in-top-5 (tune set); +3 questions, not significant |
-| [V3](#v3--qwen3-embedding-06b-planned) | `Qwen/Qwen3-Embedding-0.6B` + better chunks | **In progress** | Qwen alone: 61% top-5 (BGE 59%, n.s.). **+ Cohere rerank-v4.0-pro: 82% top-5 (p < 0.001)**. Chunking next |
+| [V2](#v2--bge-base-en-v15) | `BAAI/bge-base-en-v1.5` | Done (retired) | 53% answer-in-top-5 (tune set); +3 questions, not significant |
+| [V3](#v3--qwen3-embedding-06b--reranking--chunk-headers) | `Qwen/Qwen3-Embedding-0.6B` + chunk headers | **Done, current default** | Qwen alone 61% top-5 (n.s. vs BGE). + Cohere rerank 82% (p < 0.001). + chunk headers 85%. **End-to-end: 119/150 = 79.3%** |
+
+**Accuracy work closed on 2026-10-15 at 79.3% end-to-end.** Final pipeline: metadata
+filter → Qwen3 dense (headed chunks) top 20 + BM25 top 20 → RRF → Cohere
+`rerank-v4.0-pro` → top 5 → Cerebras `gpt-oss-120b` (prompt v2, reasoning medium) →
+retry with top 10 on NOT FOUND. See [End-to-end results](#end-to-end-results-all-150-questions).
 
 ---
 
@@ -183,7 +188,7 @@ missing (only better retrieval can fix). Root causes:
 
 ---
 
-## V3 — `Qwen3-Embedding-0.6B` (planned)
+## V3 — `Qwen3-Embedding-0.6B` + reranking + chunk headers
 
 ### Why this model
 | | V2 BGE-base | V3 Qwen3-Embedding-0.6B |
@@ -211,7 +216,7 @@ run on the 63 filings the tune questions use:
 - **Structure-aware chunks**: never cross a page, split at paragraph breaks, ~1,400 chars, same header.
   (Table→Markdown conversion was tried and dropped — PyMuPDF fragmented tables and split words.)
 
-### Workflow (planned)
+### Workflow (as planned; structure-aware chunking was not built)
 ```mermaid
 flowchart LR
     subgraph Indexing["Indexing (Colab GPU)"]
@@ -291,13 +296,112 @@ cross-encoder reads them together, so it fixes the "right chunk ranked 6–40" c
 35% of misses identified in V2). It cannot fix chunks never retrieved — remaining misses
 are the target for chunking (step 3).
 
-### Results — step 3: chunking (context header / structure-aware)
-*To be filled in.*
+### Results — step 3: chunk context headers
+Structure-aware re-chunking was not built. Instead every existing chunk got a one-line
+header, with chunk boundaries, order and count unchanged
+([`tools/add_chunk_headers.py`](../../tools/add_chunk_headers.py)):
+```
+[AMERICANEXPRESS | 10-K | FY2022 | page 124 | Note 8 DEBT > Parent Company Only]
+[VERIZON | 10-K | FY2022 | page 55 | Consolidated Balance Sheets]
+```
+The section comes from a top-to-bottom scan of each filing that tracks the current Item,
+statement, note or parent-company schedule, skips table-of-contents pages and in-sentence
+mentions, and carries the label across pages. 97% of chunks get a section; the header is
+~17 tokens. Motivation: 5 of the 16 wrong end-to-end answers came from the LLM reading
+the wrong table (e.g. a parent-company-only schedule instead of the consolidated
+statement), and a prompt rule alone (prompt v3) fixed none of them.
+
+Headed chunks were re-embedded with Qwen on Colab (`tools/colab_embed_qwen.py`, which
+now checks token lengths on a 2,000-chunk sample — tokenizing all 107K chunks at once
+exhausted Colab RAM) and indexed with `embedder3.py --headed` / `bm25_builder.py --headed`
+(`faiss_qwen_headed.index`, `bm25_index_headed/`, `chunk_meta_headed.jsonl`).
+Selected with `Retriever(embedding="qwen_headed")`. Grading strips the header line, so a
+header's page or note number can never count as an answer value.
+
+Answer in top k, 71 no-LLM questions, same pipeline, only the chunk text differs:
+
+| Configuration | @1 | @3 | **@5** | @10 | MRR |
+|---|---|---|---|---|---|
+| Qwen hybrid, no rerank | 22 | 34 | 43 (61%) | 51 | 0.433 |
+| Qwen **headed** hybrid, no rerank | **28** | **41** | **47 (66%)** | 52 | **0.511** |
+| Qwen + Cohere rerank top 40 | 40 | 54 | 58 (82%) | 61 | 0.674 |
+| Qwen **headed** + Cohere rerank top 40 | 40 | **56** | **60 (85%)** | 61 | **0.682** |
+
+McNemar, headed vs original: no rerank @1 +7/−1 (p = 0.07); with rerank @5 +5/−3
+(p = 0.73). Tune 33 → 37, holdout 25 → 23 at @5. **Verdict:** headers clearly help the
+first-stage search; after reranking the gain is small and not significant. Kept because
+it costs nothing at query time and targets the wrong-table errors end-to-end (below).
 
 ---
 
-## Next ideas (after V3)
-- Reranker on GPU (or hosted API) over the top 40 — targets the 35% of misses ranked 6–20.
-- Query rewriting for LLM questions: "inventory turnover" → separate searches for inventories (balance sheet) and cost of sales (income statement).
-- Fix the `VaR` → Activision filter bug.
-- Replace the keyword grader with an LLM judge for free-text answers.
+## End-to-end results (all 150 questions)
+Generation: Cerebras `gpt-oss-120b` (OpenAI-compatible HTTP, 5 req/min, 150/hour),
+[`source/GENERATION/answer_generator.py`](../../source/GENERATION/answer_generator.py);
+runner [`tools/test_answers.py`](../../tools/test_answers.py); comparison
+[`tools/compare_answer_runs.py`](../../tools/compare_answer_runs.py).
+
+**Grading.** Numeric answers are auto-graded; every other answer was judged by hand
+against the expected answer, with the same rules for every run: CORRECT (core answer
+matches; rounding or equivalent units accepted, e.g. −1.53% for −0.02), PARTIAL (right
+direction, key element missing or wrong), WRONG, NOT FOUND (includes non-answers not
+worded "NOT FOUND"). Verdicts are stored in `data/PROCESSED/manual_verdicts.json`,
+pinned to a hash of the exact answer text.
+
+### Pipelines compared
+| Outcome | Qwen + rerank (original chunks)¹ | **Qwen headed + rerank** |
+|---|---|---|
+| **Correct** | 117 (78.0%) | **119 (79.3%)** |
+| Partial | 5 | 3 |
+| Wrong | 16 | 20 |
+| NOT FOUND | 12 | 8 |
+
+¹ Final answers stitched from three partial runs (prompt v1 for all 150, prompt v2 re-run
+of the wrong/partial ones, top-10 retry of the NOT FOUND ones), regraded with the rules
+above (originally reported as 116/7/16/11). The headed run is one clean run of all 150
+with prompt v2 and the top-10 fallback.
+
+| Group | Original | Headed |
+|---|---|---|
+| Answer written in the filing (71) | 57 | **59** |
+| ├ tune (43) | 33 | 35 |
+| └ holdout (28) | 24 | 24 |
+| Needs calculation / synthesis (79) | 60 | 60 |
+| By type: domain-relevant / metrics-generated / novel-generated (50 each) | 41 / 42 / 34 | 41 / 44 / 34 |
+
+Headed vs original: **+10 / −8, McNemar p = 0.81 — not significant.** Fixed include 3 of
+the 5 wrong-table errors (AmEx largest liability, Verizon quick ratio, AMD D&A margin),
+Best Buy acquisitions and three former NOT FOUNDs. Lost include three yes/no flips
+(Boeing legal, PepsiCo legal, AmEx operating margin) — likely run-to-run LLM variance,
+which at ±8 questions is the size of the gains being measured.
+
+### Prompt history
+| Prompt | Change | Result | Status |
+|---|---|---|---|
+| v1 | Extract figures, then compute; units; fiscal-year column; NOT FOUND | 106/150 (first full run) | Replaced |
+| **v2** | General rules from v1 failures: apply defined formulas exactly, keep signs, figure before judgement, specific "what drove" factors | +4 on the re-run wrong answers | **Active** |
+| v3 | v2 + consolidated statements / never assume zero / no metric substitution | 0 of 16 fixed, 1 correct lost | Removed |
+| v4 + reasoning "high" | New format: INPUTS (row label as printed, period, source) → FORMULA → checks → answer | On the 31 headed failures: 4 fixed (all non-calculation; 3 were earlier flips), **0 of 18 calculation failures fixed**, 5 empty answers (hidden reasoning used the whole 6,000-token budget) | Kept in code for reference, not used |
+
+### Where the 31 remaining failures come from (headed run)
+| Cause | ~Count |
+|---|---|
+| Needed figures not retrieved: multi-year / multi-statement questions, wrong filing | ~14 |
+| LLM picked the wrong figure although every input was in its chunks | ~7 |
+| Yes/no judgement flips between runs | ~4 |
+| Ambiguous or debatable expected answer — left alone to avoid overfitting | ~4–5 |
+
+Of the 11 calculation questions answered with a wrong number, 7 had every needed input in
+the chunks (checked against the labelled evidence), 1 had a balance sheet cut off at a
+chunk boundary, and 3 retrieved the wrong filing or period.
+
+---
+
+## Next ideas (not pursued — accuracy work closed at 79.3%)
+- **Whole-statement retrieval** for calculation questions: fetch the complete statement
+  pages for the requested filing and year, using the section labels in the chunk headers.
+- **Multi-year metadata filter**: CAGR / year-over-year questions need earlier filings;
+  fix the `VaR` → Activision bug, "this 10-K" with no year, guidance that sits in the
+  previous year's Q4 release.
+- A stronger answering model for calculation questions (test on the 7 good-chunk failures).
+- Measure run-to-run variance before trusting any gain under ~8 questions.
+- An LLM judge to replace manual grading of free-text answers.

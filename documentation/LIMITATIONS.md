@@ -1,126 +1,123 @@
 # Known Limitations
 
-Honest assessment of the retrieval pipeline. Nothing here is hypothetical; every item is either measured or a known design decision we made and can name.
+Honest assessment of the FilingLens pipeline as of 2026-10-15 (accuracy work closed).
+Every item is measured or a named design decision. Full history and numbers:
+[`experiment_log/README.md`](experiment_log/README.md).
 
-## Measured Results
-
-| Config | Grounded answer | Correct doc | Hit@1 | Hit@3 | Hit@5 | MRR | Latency |
-|---|---|---|---|---|---|---|---|
-| Baseline (BM25 + dense + RRF) | 18.0% | 38.7% | 5.3% | — | 12.7% | 0.080 | 0.03s |
-| **+ metadata filtering** | **46.7%** | **82.0%** | **17.3%** | **28.0%** | **32.7%** | **0.230** | 0.03s |
-| + cross-encoder reranking | 49.3% | 83.3% | 12.7% | 25.3% | 32.0% | 0.197 | 1.82s |
-| *Oracle doc filter (diagnostic)* | *62.0%* | *100%* | *26.0%* | *44.0%* | *49.3%* | *0.353* | *0.03s* |
-
-"Grounded answer" is the primary metric: the expected value found **in the correct document**. The oracle row uses the benchmark's ground-truth document name — data leakage, reported only as a ceiling, never as a result.
-
-### The metric cannot reach 100% — 26.7% of answers must be computed
-
-**38% of questions (57/150) have an answer that does not appear in their own labelled evidence**, because the expected value must be calculated: ratios, multi-year averages, year-over-year deltas. Examples: *"FY2019 fixed asset turnover ratio"* (revenue ÷ average fixed assets), *"FY2017-FY2019 3 year average of capex as a % of revenue"*. No retriever can surface a number that was never written down.
-
-Accounting for figures that are retrievable from a non-labelled page of the correct filing, the true satisfiable set is **110/150 (73.3%)**:
+## Current system and results
 
 ```
- 40 (26.7%)  answer exists nowhere retrievable -- pure computation, needs the LLM
-110 (73.3%)  answer IS retrievable  <-- the real ceiling
- ├─  70      currently found   = 46.7% of all, 63.6% OF ACHIEVABLE
- └─  40      currently missed
-     ├─ ~23  wrong document (extraction is 82%, not 100%)
-     └─ ~17  right document, wrong chunk
+Question → metadata filter (company + fiscal year from the question text)
+         → Qwen3-Embedding-0.6B dense top 20 + BM25 top 20 on headed chunks
+         → RRF → Cohere rerank-v4.0-pro → top 5
+         → Cerebras gpt-oss-120b (prompt v2) → answer; retry with top 10 on NOT FOUND
 ```
 
-**Report "% of achievable" alongside the raw rate.** Measuring against an unreachable 100% understates retrieval quality by ~17pp and misdirects effort.
+| Measure | Result |
+|---|---|
+| **End-to-end, all 150 questions** | **119 correct (79.3%)**, 3 partial, 20 wrong, 8 NOT FOUND |
+| Answer chunk in top 5 (71 questions whose answer is written in the filing) | 60 (85%) |
+| Same, holdout 28 (never tuned on) | 23 (82%) |
 
-**How this was missed initially:** the loose "answer in text" metric read 60-62% across all four configurations — baseline, filtering, reranking and oracle alike. A metric that does not move while the system improves 2.6x is a metric at its ceiling. That signal was printed four times before it was investigated.
+## Where the remaining 31 failures come from
 
-### Failure breakdown, current config (metadata filtering)
-
-```
-Right document AND right page :  49/150  (32.7%)
-Right document, WRONG page    :  74/150  (49.3%)   ← now the dominant failure
-WRONG document entirely       :  27/150  (18.0%)
-```
+| Cause | ~Count | Limitation |
+|---|---|---|
+| Needed figures not retrieved | ~14 | L-1, L-2, L-3 |
+| LLM picks the wrong figure although every input is in its chunks | ~7 | L-6 |
+| Yes/no judgements flip between runs | ~4 | L-7 |
+| Ambiguous or debatable expected answer | ~4–5 | L-12 |
 
 ---
 
 ## Retrieval
 
-**L-1. ~~No metadata filtering~~ — RESOLVED.** Was the largest flaw at 61.3% wrong-document retrieval. Implemented in `source/RETRIEVAL/metadata_filter.py`: extracts company and fiscal year from the question text (not from the benchmark labels) and restricts search to matching filings, reducing the search space from 360 documents to an average of 2.9. Wrong-document fell 61.3% → 18.0%; grounded answers rose 18.0% → 46.7%.
+**L-1. The metadata filter keeps one fiscal year.** Questions that span years (a 2-year
+CAGR, "FY20 vs FY21") need earlier filings that the filter excludes. Forward-looking
+guidance lives in the *previous* year's Q4 earnings release (e.g. FY2023 guidance in the
+FY2022 Q4 release) and is filtered out. "This 10-K" with no year is not resolved. Known
+bug: "VaR" in a JPMorgan question matches Activision.
 
-Residual gaps: 12/150 questions name no company in their text at all (*"Based on the information provided..."*), and 2/150 have the correct filing excluded because the answer lives in an adjacent year — forward-looking FY2023 guidance appears in the FY2022 Q4 earnings release, not a FY2023 filing.
+**L-2. Calculation questions need several statements at once.** A ratio may need the
+balance sheet, income statement and cash flow statement; top-5 chunks often cover only
+some of them, which produces most NOT FOUND answers. Not addressed: per-statement
+sub-queries exist in the retriever (`targeted=True`) but are off and unmeasured on the
+current pipeline; whole-statement retrieval was proposed but not built.
 
-**L-2. Cross-encoder reranking measured, and not worth enabling.** Implemented and measured; gained only +2.6pp on grounded answers while *degrading* page precision (Hit@1 17.3% → 12.7%, MRR 0.230 → 0.197) and increasing latency 60× (0.03s → 1.82s per query). The cross-encoder optimizes for "does this chunk answer the question," which favours MD&A narrative over the terse financial-statement page the benchmark labels as evidence. Code is retained but disabled by default.
+**L-3. Fixed-size chunks cut tables.** Chunks are 2,000 characters with 300 overlap,
+ignoring layout. A balance sheet can start partway into a chunk, so the top rows are in
+the previous chunk (seen in one wrong answer). Context headers label each chunk with
+its statement but do not change boundaries.
 
-**L-2b. ~~Within-document retrieval is the dominant failure~~ — CORRECTED.** This was diagnosed wrongly. The oracle run's 38% failure rate was read as a retrieval problem, when most of it was the metric asking for values that do not exist in any document (see above). The measured reality:
+**L-4. Section labels are heuristic.** Headers come from a line-by-line heading
+detector. A chunk spanning two sections gets only the first label; earnings releases and
+8-Ks have little structure, so many of their chunks carry only company, type, period and
+page; statement titles without "Consolidated" or "Balance Sheet" are deliberately not
+labelled.
 
-- Retrieval recall **given the correct document is 81.7%** (76 of the 93 questions whose answer is present in their labelled evidence)
-- Genuine within-document failures: **17 questions (11.3%)**, not 38%
-- 17 further questions were satisfied from a *non-labelled* page of the correct filing, confirming that figures repeat within a filing and that document-scoped scoring is the right choice over page-scoped
+**L-5. External API limits.** Reranking uses Cohere's trial key (10 calls/min,
+1,000/month). A full 150-question run spends ~150–165 calls. A local cross-encoder of
+similar quality takes ~1–1.5 min per question on this CPU.
 
-The correct priority order follows from the recoverable counts, not from the oracle gap: company/year extraction (~23 questions recoverable, cheap) now outranks the embedding upgrade (~17 questions, ~90 minutes of compute).
+## Generation
 
-**L-3. No query understanding.** Questions are passed through verbatim. No company/year extraction, no rewriting, no decomposition — so multi-part questions ("compare 2018 vs 2022 margins") get one undifferentiated search.
+**L-6. The LLM picks wrong figures in calculations.** In 7 of 11 wrong calculations
+every input was in the chunks; the model divided by the wrong line, used a quarterly
+column for a full year, substituted a similar metric, or dropped a sign. Two prompt
+changes did not fix this: v3 (more rules) fixed 0 of 16; v4 (row labels, formula and
+checks, with high reasoning effort) fixed 0 of 18 calculation failures and returned 5
+empty answers when hidden reasoning used the whole token budget. Arithmetic is not
+delegated to code.
 
-**L-4. Overlapping chunks can crowd out the top-5.** Chunks step 1700 characters but span 2000, so adjacent chunks share text. If chunk N is relevant, N±1 usually scores highly too — potentially consuming several of the five slots with near-duplicate content. De-duplication is implemented but disabled by default (not yet measured).
+**L-7. Answers vary between runs.** Temperature is 0, yet answers are not fully
+repeatable. Between the original and headed runs 10 questions were gained and 8 lost,
+including yes/no judgements (Boeing and PepsiCo legal matters) that the retrieval change
+should barely affect. Run-to-run variance has not been measured directly; gains smaller
+than ~8 questions cannot be attributed to a change without repeated runs.
 
-## Embedding
+**L-8. Rate limits shape the system.** Cerebras allows 5 requests/min and 150/hour; a
+full run takes ~45–60 minutes. There is no batching or caching across users.
 
-**L-5. Silent truncation — roughly 45% of every chunk never reaches its vector.** `all-MiniLM-L6-v2` accepts a maximum of 256 tokens. Our chunks are ~2000 characters ≈ 450 tokens. The model silently discards the remainder. Semantic search therefore cannot find anything that appears only in the back half of a chunk. This is a design mismatch we introduced by choosing chunk size before checking the model's input limit.
+## Evaluation
 
-**L-6. Weak embedding model.** `all-MiniLM-L6-v2` is small (384 dimensions) and older. Stronger open models (`BGE-base-en-v1.5`, `gte-base`) score substantially higher on retrieval benchmarks and accept 512 tokens, which would also mitigate L-5.
+**L-9. Free-text answers are graded by hand.** The automatic grader handles numbers
+only; about 45% of answers needed a human verdict. Verdicts follow written rules and are
+pinned to the answer text, but there is no LLM judge and no second grader.
 
-**L-7. No domain adaptation.** A general-purpose model is being applied to dense financial and accounting language with no finance-specific tuning.
+**L-10. The baseline comparison is not a clean run.** The original-chunk result
+(117/150) is stitched from three partial runs; the headed result (119/150) is one clean
+run. Headed vs original is +10 / −8, p = 0.81 — not significant.
 
-## Chunking
+**L-11. Small samples.** With 71 retrieval questions or 150 end-to-end, differences of a
+few questions are noise (paired McNemar tests are reported throughout). The 28-question
+holdout is too small to confirm small gains.
 
-**L-8. Fixed-size cuts ignore document structure.** Chunks are cut at exact character counts with no awareness of tables, sections, or headings. A financial table can be split so that its numbers land in one chunk and its column headers (the fiscal years) land in another. The 300-character overlap means the complete version exists in a neighbouring chunk, so nothing is lost outright — but the split chunk itself can be misleading in isolation.
-
-**L-9. Tables carry no structural information.** Tables are extracted as linear text. Row/column relationships are implicit in reading order only. We verified that plain extraction captures the *content* accurately (100% containment against ground-truth evidence text across 189 samples), but never verified that an LLM can correctly attribute a number to the right year column from that linearized form.
-
-**L-10. Chunk boundaries ignore page boundaries by design.** This is intentional (a topic spanning a page break isn't cut), but it means a chunk can span two pages, which slightly complicates page-level scoring and citation.
-
-## Evaluation methodology
-
-**L-11. Page-level Hit@5 is overly strict.** Financial figures legitimately repeat within a single filing — a revenue number appears in the income statement, the MD&A narrative, the segment footnote, and the selected-financial-data table. FinanceBench labels only one page as evidence, so retrieving a *different valid page containing the same correct figure* is scored as a failure.
-
-**L-12. "Answer value in retrieved text" (60%) is inflated by false positives.** A 2018 figure appears in the 2018, 2019, and 2020 filings alike. When we retrieve the wrong year's document, the expected value still "matches" — rewarding right-number-wrong-source. This metric should be scoped to the correct document.
-
-**L-13. Numeric matching is loose.** Matching allows 1% relative tolerance *and* power-of-ten scale differences (to handle millions vs billions). That tolerance can produce accidental matches on unrelated figures.
-
-**L-14. Text-answer matching is crude.** Non-numeric answers are judged by keyword overlap at a 50% threshold — no semantic understanding, no LLM judge.
-
-**L-15. No dev/holdout split.** All 150 questions were used for this evaluation. The original plan called for 100 dev + 50 holdout. Continuing to tune against all 150 risks overfitting to the test set and producing optimistic final numbers.
-
-**L-16. Single run, no confidence intervals or significance testing.** With n=150, differences of a few percentage points between configurations may be noise. No McNemar test yet.
+**L-12. Some expected answers are debatable.** A few gold answers rely on a convention
+(average vs ending inventory), an unusual figure (a spin-off cost of 77.78) or a
+judgement ("similar company"). They are left as failures rather than tuned for.
 
 ## Not yet built
 
-**L-17. No answer generation.** Retrieval only. No LLM is involved yet, so end-to-end answer accuracy is unmeasured.
+**L-13. No guardrails** — no off-topic or prompt-injection checks, no check that the
+answer's numbers appear in the retrieved text, no confidence threshold, no financial
+advice disclaimer. `source/GUARDRAILS/` is empty.
 
-**L-18. No guardrails.** No off-topic detection, prompt-injection checks, grounding verification, or low-confidence refusal.
+**L-14. No API** — the pipeline runs from scripts; nothing is exposed as a service.
 
-**L-19. No tracing.** No latency, token, or cost measurement per request.
+**L-15. No tracing** — per-step latency, tokens and cost are printed by the test runner
+but not recorded per request. `source/TRACING/` is empty.
 
-**L-20. Indexes are local files, not the planned database.** FAISS + bm25s on disk rather than PostgreSQL + pgvector. Deliberate (avoids a fiddly Windows pgvector build while iterating), but it means no metadata filtering in SQL, no concurrent access, and no persistence guarantees.
+**L-16. No deployment, tests or CI** — no Dockerfile, no unit tests, no automated checks.
 
-**L-21. No API, no tests, no CI.** Nothing is exposed as a service; there is no test suite and no automated quality gate.
+**L-17. Local files instead of a database.** FAISS and bm25s indexes on disk (~2 GB in
+`data/PROCESSED/`, gitignored), not PostgreSQL + pgvector. Fine for one user; no
+concurrent writes.
 
 ## Data handling
 
-**L-22. Charts and graphs are ignored.** Verified to be a non-issue for *this* dataset — no question depends on reading a chart, and every evidence entry is substantial text (minimum 67 characters, median 1,271). It remains a limitation for general use on filings where a figure appears only in a plotted graphic.
+**L-18. Charts are ignored.** Verified to be a non-issue for this benchmark (no question
+depends on a chart), but a figure that appears only in a graphic cannot be found.
 
----
-
-## Priority order for the next iteration
-
-Ordered by questions recoverable per unit of effort, after correcting the L-2b misdiagnosis:
-
-1. **Company/year extraction coverage (L-1 residual) — ~23 questions, cheap.** Pure query-side logic, no re-indexing. Concrete known cases: 12 questions name no company in their text at all (*"Based on the information provided..."*), and the year heuristic misses filings where the answer sits in an adjacent year — forward-looking FY2023 guidance appears in the FY2022 Q4 earnings release.
-2. **Move to LLM answer generation — 40 questions are blocked on it.** 26.7% of questions require arithmetic over retrieved tables (ratios, averages, deltas). Retrieval is already doing all it can for these; only a model performing the computation can close them. This is a stronger argument for advancing to the next pipeline stage than for further retrieval tuning.
-3. **L-5 / L-6 embedding — ~17 questions, ~90 minutes.** Fix the 256-token truncation (chunks are ~450 tokens, so ~45% of every chunk never reaches its vector) and upgrade to a 512-token model (BGE-base-en-v1.5 or gte-base). Lower priority than previously stated: the recoverable count is 17, not the 57 implied by the earlier misreading.
-4. **L-15 dev/holdout split** — should be established *before* further tuning. Six configurations have now been run against all 150 questions; overfitting risk is accumulating.
-5. **L-8 / L-9 chunking** — revisit alongside item 3, since chunk size must fit the model's input limit. That mismatch is what created L-5.
-
-~~L-1 metadata filtering~~ — done, +28.7pp.
-~~L-12 / L-11 metric fix~~ — done; the old loose metric was inflating results by 3.3×.
-~~L-2 re-ranking~~ — measured and rejected; see L-2 above.
-~~L-2b within-document bottleneck~~ — misdiagnosis, corrected above.
+**L-19. Tables are linear text.** PyMuPDF extracts tables in reading order; row/column
+structure is implicit. Table-to-Markdown conversion was tried and dropped because it
+fragmented tables and split words.
