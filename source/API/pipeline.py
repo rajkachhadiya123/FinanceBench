@@ -14,6 +14,7 @@ no second Cohere call, and its top 10 is exactly the list the top 5 came from.
 The retriever is not thread-safe (it seeks in a shared file handle and reuses a
 mask buffer), and both APIs are rate-limited anyway, so calls are serialized.
 """
+import re
 import threading
 from dataclasses import dataclass
 
@@ -23,8 +24,12 @@ from source.GENERATION.answer_generator import (
     AnswerGenerator,
 )
 from source.GUARDRAILS.guards import GUARDRAILS_VERSION, check_output
+from source.RETRIEVAL.metadata_filter import FILENAME_TYPOS, YEAR_IN_NAME_RE, parse_doc_name
 from source.RETRIEVAL.retriever import Retriever
 from source.TRACING.tracer import current_trace, span
+
+
+DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 class GenerationFailed(RuntimeError):
@@ -65,6 +70,13 @@ class QAPipeline:
     @property
     def chunks_indexed(self) -> int:
         return len(self.retriever.meta)
+
+    def documents(self) -> list[dict]:
+        """Every indexed filing, grouped by company (built from the loaded indexes)."""
+        return catalogue(self.retriever.positions_by_doc)
+
+    def embedding_cache_stats(self) -> dict:
+        return self.retriever.embedding_cache.stats()
 
     def filings_for(self, question: str) -> list[str] | None:
         """Filings the metadata filter keeps; None means no company was recognised."""
@@ -124,6 +136,32 @@ class QAPipeline:
 
     def close(self) -> None:
         self.retriever.close()
+
+
+def catalogue(positions_by_doc: dict[str, list[int]]) -> list[dict]:
+    """
+    [{"company": "AMERICAN EXPRESS", "key": "americanexpress", "filings": [...]}, ...]
+
+    "key" is the normalized name the metadata filter matches against; a filing's
+    "type" is what follows the period in its name (10K, 10Q, 8K, EARNINGS, ...).
+    """
+    companies: dict[str, dict] = {}
+    for doc_name, positions in positions_by_doc.items():
+        key, year, quarter, doc_type = parse_doc_name(doc_name)
+        key = FILENAME_TYPOS.get(key, key)  # same mapping the metadata filter uses
+        parts = doc_name.split("_")
+        period_at = next((i for i, p in enumerate(parts) if YEAR_IN_NAME_RE.match(p)), 1)
+        filed = DATE_RE.search(doc_type)    # 8-Ks carry their filing date in the name
+        entry = companies.setdefault(key, {"company": " ".join(parts[:period_at]).upper(),
+                                           "key": key, "filings": []})
+        entry["filings"].append({"doc_name": doc_name,
+                                 "type": re.split(r"[_-]", doc_type)[0].upper() or "FILING",
+                                 "fiscal_year": year, "quarter": quarter,
+                                 "filed": filed.group() if filed else None,
+                                 "chunks": len(positions)})
+    for entry in companies.values():
+        entry["filings"].sort(key=lambda f: (f["fiscal_year"] or 0, f["quarter"] or "", f["doc_name"]))
+    return sorted(companies.values(), key=lambda e: e["key"])
 
 
 def public_chunk(chunk: dict) -> dict:

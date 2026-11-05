@@ -16,6 +16,8 @@ chunks.jsonl in file order.
 """
 import json
 import sys
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 import bm25s
@@ -93,6 +95,48 @@ STATEMENT_HINTS = {
 RERANK_CANDIDATES = {"local": 20, "cohere": 40}
 
 
+EMBEDDING_CACHE_SIZE = 1024  # query vectors kept in memory (1024 x 1024 floats ~ 4 MB)
+
+
+class EmbeddingCache:
+    """
+    Least-recently-used cache of query vectors, keyed by the exact text embedded.
+
+    Query embedding is the slowest retrieval step on CPU (~1 s for Qwen, measured by
+    tracing), and the same text is often embedded again: /query and /retrieve on one
+    question, use_cache=false re-runs, retrieve calls with a different top_k or rerank
+    setting, and an agent repeating a search. Exact text only -- a different wording
+    is a different vector.
+    """
+
+    def __init__(self, max_size: int = EMBEDDING_CACHE_SIZE):
+        self.max_size = max_size
+        self._items: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = self.misses = 0
+
+    def get(self, text: str) -> np.ndarray | None:
+        with self._lock:
+            vec = self._items.get(text)
+            if vec is None:
+                self.misses += 1
+                return None
+            self._items.move_to_end(text)
+            self.hits += 1
+            return vec
+
+    def put(self, text: str, vec: np.ndarray) -> None:
+        with self._lock:
+            self._items[text] = vec
+            self._items.move_to_end(text)
+            while len(self._items) > self.max_size:
+                self._items.popitem(last=False)
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"entries": len(self._items), "hits": self.hits, "misses": self.misses}
+
+
 class Retriever:
     def __init__(self, use_reranker: bool | str = False, embedding: str = DEFAULT_EMBEDDING):
         """
@@ -104,6 +148,7 @@ class Retriever:
         spec = EMBEDDINGS[embedding]
         print(f"Loading indexes (dense: {spec['model']}) ...")
         self.embedder = SentenceTransformer(spec["model"])
+        self.embedding_cache = EmbeddingCache()
         self.query_prefix = spec["query_prefix"]
         self.stemmer = Stemmer.Stemmer("english")
         self.embedding = embedding
@@ -233,10 +278,15 @@ class Retriever:
         # normalize_embeddings must match how chunks were embedded, or the
         # inner-product index returns meaningless distances. The prefix is
         # query-side only (empty for MiniLM; BGE's retrieval instruction).
-        with span("retrieval.embed"):
-            vec = self.embedder.encode(
-                [self.query_prefix + query], convert_to_numpy=True, normalize_embeddings=True
-            ).astype(np.float32)
+        with span("retrieval.embed") as s:
+            text = self.query_prefix + query
+            vec = self.embedding_cache.get(text)
+            s.set(cached=vec is not None)
+            if vec is None:
+                vec = self.embedder.encode(
+                    [text], convert_to_numpy=True, normalize_embeddings=True
+                ).astype(np.float32)
+                self.embedding_cache.put(text, vec)
 
         params = None
         if allowed is not None:

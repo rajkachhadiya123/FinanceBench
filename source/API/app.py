@@ -7,7 +7,8 @@ FilingLens HTTP API.
     DELETE /cache           empty the answer cache
     GET    /traces          latest traced requests
     GET    /traces/{id}     one request step by step (id = X-Request-ID header / trace_id)
-    GET    /stats?hours=24  volume, errors, cache hit rate, guardrails, tokens, p50/p95 per step
+    GET    /stats?hours=24  volume, errors, cache hit rate, guardrails, tokens, cost, p50/p95 per step
+    GET    /documents       companies and filings the API can answer about (?company= filter)
 
 Run from the repository root:
     python -m uvicorn source.API.app:app --port 8000
@@ -45,7 +46,9 @@ from source.API.pipeline import GenerationFailed, QAPipeline
 from source.GENERATION.answer_generator import PROMPT_VERSION, DailyLimitReached
 from source.GUARDRAILS.guards import DISCLAIMER, check_input, needs_disclaimer
 from source.GUARDRAILS.rate_limit import RateLimiter
+from source.RETRIEVAL.metadata_filter import normalize as normalize_name
 from source.SHARED.cache import AnswerCache, make_key
+from source.TRACING.costs import PRICES, estimate_cost
 from source.TRACING.tracer import TraceStore, current_trace, span, start_trace
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -91,7 +94,7 @@ async def trace_requests(request: Request, call_next):
         except Exception as exc:  # unexpected failure: record it and answer 500
             trace.update(error=f"{type(exc).__name__}: {exc}"[:500])
             response = JSONResponse({"detail": "Internal server error"}, status_code=500)
-        trace.update(status_code=response.status_code)
+        trace.update(status_code=response.status_code, cost_usd=estimate_cost(trace.fields))
         response.headers["X-Request-ID"] = trace.trace_id
     return response
 
@@ -174,6 +177,8 @@ class HealthResponse(BaseModel):
     cache_path: str
     cache: dict
     trace_path: str
+    embedding_cache: dict
+    prices_usd: dict
 
 
 # --- guard helpers ----------------------------------------------------------------
@@ -293,7 +298,23 @@ def health() -> HealthResponse:
         status="ok", chunks_indexed=pipeline.chunks_indexed, pipeline_version=pipeline.version,
         prompt_version=PROMPT_VERSION, rate_limits_per_minute=state["limiter"].limits,
         cache_path=str(CACHE_PATH), cache=state["cache"].stats(), trace_path=str(TRACE_PATH),
+        embedding_cache=pipeline.embedding_cache_stats(), prices_usd=PRICES,
     )
+
+
+@app.get("/documents")
+def documents(company: str | None = None) -> dict:
+    """
+    What the API can answer about: every indexed filing grouped by company.
+    ?company= filters by name (case and spacing ignored), e.g. "american express".
+    """
+    companies = state["pipeline"].documents()
+    if company:
+        wanted = normalize_name(company)
+        companies = [c for c in companies if wanted in c["key"]]
+    return {"companies": len(companies),
+            "filings": sum(len(c["filings"]) for c in companies),
+            "items": companies}
 
 
 @app.delete("/cache")
