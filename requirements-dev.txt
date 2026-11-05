@@ -1,0 +1,2 @@
+# Test-only dependencies (CI and local). Install: python -m pip install -r requirements-dev.txt
+pytest==9.2.0

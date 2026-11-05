@@ -135,14 +135,34 @@ Order agreed with the user; each step on its own branch + PR:
    it only catches invented numbers; confidence: every answered benchmark question ≥ 0.816,
    out-of-scope questions 0.28–0.39. Observation: for "is X a good investment" the LLM
    still answers Yes/No — the disclaimer is attached, the prompt was not changed.
-4. **Tracing**: per-request latency per step, tokens, cost, retrieved chunk ids
-   (Langfuse or JSON logs). `source/TRACING/` is empty.
-5. **Deployment**: Dockerfile + docker-compose; mount `data/PROCESSED/` (~2 GB) rather
+4. ✅ **Tracing** (`feat/tracing`): `source/TRACING/tracer.py` — `start_trace()` / `span()`
+   (context variable, works across FastAPI worker threads, no-op outside a request),
+   `TraceStore` in a separate `data/PROCESSED/traces.db` (traces + spans; metadata only,
+   200-char answer preview + cache key; **30-day retention**, `FILINGLENS_TRACE_RETENTION_DAYS`;
+   cached answers keep no expiry; a failed save never breaks a request). API middleware
+   traces `/query` and `/retrieve`, returns `X-Request-ID` + `trace_id`; spans for guards,
+   cache, filter/embed/dense/bm25/rrf, `rerank.cohere`, `llm.answer`, `llm.retry_top10`,
+   provider rate-limit waits. Endpoints `GET /traces`, `GET /traces/{id}`, `GET /stats`.
+   Live-tested on 9 requests; finding: Qwen query embedding on CPU (~1.0 s p50) is the
+   slowest step, more than Cohere (0.55 s) or the LLM (0.53 s). `cost_usd` is not
+   configured (no prices set) — tokens and call counts are recorded.
+5. ✅ **Tests + CI** (`feat/tests`): `pytest` — 74 tests + 1 xfail (the known VaR →
+   Activision filter bug, marked strict so a fix is noticed), ~11 s, no API keys, no
+   network, no `data/PROCESSED`. `tests/UNIT/` (metadata filter, RRF/helpers, guards incl.
+   "0 of 150 benchmark questions blocked", cache, rate limiter, tracer, answer parsing,
+   chunk headers) and `tests/INTEGRATION/test_api.py` (FastAPI with a fake pipeline:
+   cache hit, 400/422/429/502/503, traces, stats). Run: `python -m pytest -rx`.
+   `.github/workflows/tests.yml` runs it on every push/PR (Python 3.10, CPU-only torch).
+   `requirements-dev.txt` holds pytest.
+6. **Cleanup + setup guide**: the root and folder READMEs are still Week-0 templates
+   (mention `01-DATA/`, pgvector, `ingest.py`) — rewrite to match reality; document how to
+   get `data/RAW` and rebuild `data/PROCESSED` (no download script exists; `.gitignore`
+   claims one does). The old `workflows/` folder is superseded by `.github/workflows/`.
+7. **Deployment**: Dockerfile + docker-compose; mount `data/PROCESSED/` (~2 GB) rather
    than baking it in; secrets via env.
-6. **Tests + CI**: unit tests (metadata filter, RRF, header detection, formula check),
-   a small end-to-end smoke test, GitHub Actions.
-7. **Cleanup**: the root and folder READMEs are still Week-0 templates (mention
-   `01-DATA/`, pgvector, `ingest.py`, Langfuse) — rewrite to match reality.
+8. **Evaluation harness**: config-driven runs (`experiments/*.yaml`), a run registry,
+   standard report, LLM judge validated against `manual_verdicts.json`, a small smoke set
+   for CI. Then the separate AI-agent project, measured against 79.3%.
 
 ## 9. Environment gotchas
 - Background processes started by the assistant die when the Claude Code session ends.
