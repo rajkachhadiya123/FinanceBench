@@ -32,6 +32,7 @@ from source.INGESTION import embedder, embedder3  # noqa: E402
 # import and the "bge" entry in EMBEDDINGS below.
 # from source.INGESTION import embedder2  # noqa: E402
 from source.RETRIEVAL.metadata_filter import MetadataFilter  # noqa: E402
+from source.TRACING.tracer import span  # noqa: E402  (no-op outside a traced request)
 PROCESSED = ROOT / "data" / "PROCESSED"
 CHUNKS_PATH = PROCESSED / "chunks.jsonl"
 META_PATH = PROCESSED / "chunk_meta.jsonl"
@@ -163,7 +164,9 @@ class Retriever:
             # company/year extraction could reach.
             allowed_positions = self._positions_for_docs({oracle_doc})
         elif metadata_filter:
-            allowed_positions = self._allowed_positions(query)
+            with span("retrieval.filter") as s:
+                allowed_positions = self._allowed_positions(query)
+                s.set(chunks_kept=None if allowed_positions is None else len(allowed_positions))
 
         queries = [query]
         if targeted:
@@ -175,7 +178,9 @@ class Retriever:
         for sub_query in queries:
             ranked_lists.append(self._dense_search(sub_query, CANDIDATES_K, allowed_positions))
             ranked_lists.append(self._bm25_search(sub_query, CANDIDATES_K, allowed_positions))
-        fused = self._rrf_fuse(ranked_lists)
+        with span("retrieval.rrf") as s:
+            fused = self._rrf_fuse(ranked_lists)
+            s.set(candidates=len(fused))
 
         if dedup:
             fused = self._drop_overlapping(fused)
@@ -184,7 +189,9 @@ class Retriever:
         if rerank:
             if self.reranker is None:
                 raise RuntimeError("Retriever was built with use_reranker=False.")
-            fused, scores = self._rerank(query, fused, top_k)
+            with span(f"rerank.{self.reranker_kind}") as s:
+                fused, scores = self._rerank(query, fused, top_k)
+                s.set(docs=len(scores), best=round(max(scores.values()), 4) if scores else None)
 
         results = [self._build_result(pos, rank) for rank, pos in enumerate(fused[:top_k], 1)]
         for result in results:
@@ -226,15 +233,19 @@ class Retriever:
         # normalize_embeddings must match how chunks were embedded, or the
         # inner-product index returns meaningless distances. The prefix is
         # query-side only (empty for MiniLM; BGE's retrieval instruction).
-        vec = self.embedder.encode(
-            [self.query_prefix + query], convert_to_numpy=True, normalize_embeddings=True
-        ).astype(np.float32)
+        with span("retrieval.embed"):
+            vec = self.embedder.encode(
+                [self.query_prefix + query], convert_to_numpy=True, normalize_embeddings=True
+            ).astype(np.float32)
 
         params = None
         if allowed is not None:
             params = faiss.SearchParameters(sel=faiss.IDSelectorBatch(allowed))
-        _scores, positions = self.faiss_index.search(vec, k, params=params)
-        return [int(p) for p in positions[0] if p >= 0]
+        with span("retrieval.dense") as s:
+            _scores, positions = self.faiss_index.search(vec, k, params=params)
+            hits = [int(p) for p in positions[0] if p >= 0]
+            s.set(hits=len(hits))
+        return hits
 
     def _bm25_search(self, query: str, k: int, allowed: np.ndarray | None = None) -> list[int]:
         # Same stopwords + stemmer as bm25_builder.py, so query terms map onto
@@ -250,10 +261,13 @@ class Retriever:
             mask = self._mask_buffer
             k = min(k, len(allowed))
 
-        positions, _scores = self.bm25.retrieve(
-            tokens, k=k, weight_mask=mask, show_progress=False
-        )
-        return [int(p) for p in positions[0]]
+        with span("retrieval.bm25") as s:
+            positions, _scores = self.bm25.retrieve(
+                tokens, k=k, weight_mask=mask, show_progress=False
+            )
+            hits = [int(p) for p in positions[0]]
+            s.set(hits=len(hits))
+        return hits
 
     @staticmethod
     def _rrf_fuse(ranked_lists: list[list[int]], k: int = RRF_K) -> list[int]:

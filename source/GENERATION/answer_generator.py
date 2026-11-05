@@ -25,6 +25,8 @@ import time
 import httpx
 from dotenv import load_dotenv
 
+from source.TRACING.tracer import span
+
 # --- Groq (retired; daily free-tier quota too small) -------------------------
 # from groq import APIStatusError, Groq, RateLimitError
 # DEFAULT_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -291,7 +293,8 @@ class AnswerGenerator:
                     raise DailyLimitReached(
                         f"Cerebras asked to wait {wait:.0f}s -- daily quota reached")
                 print(f"    [rate limited; waiting {wait:.0f}s]", flush=True)
-                time.sleep(wait)
+                with span("llm.rate_limit_wait", seconds=round(wait)):
+                    time.sleep(wait)
                 continue
             last_error = RuntimeError(f"HTTP {response.status_code}: {response.text[:150]}")
             if response.status_code < 500 or transient_attempts >= len(RETRY_DELAYS):

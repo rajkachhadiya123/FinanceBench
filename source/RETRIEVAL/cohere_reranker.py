@@ -15,6 +15,8 @@ import time
 import httpx
 from dotenv import load_dotenv
 
+from source.TRACING.tracer import span
+
 load_dotenv()
 
 API_URL = "https://api.cohere.com/v2/rerank"
@@ -42,7 +44,8 @@ class CohereReranker:
             })
             if response.status_code == 429:  # per-minute trial limit
                 print(f"    [Cohere rate limit; waiting {RATE_LIMIT_WAIT}s]", flush=True)
-                time.sleep(RATE_LIMIT_WAIT)
+                with span("rerank.rate_limit_wait", seconds=RATE_LIMIT_WAIT):
+                    time.sleep(RATE_LIMIT_WAIT)
                 continue
             if response.status_code >= 500 and attempt < 4:
                 time.sleep(5 * (attempt + 1))

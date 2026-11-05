@@ -24,6 +24,7 @@ from source.GENERATION.answer_generator import (
 )
 from source.GUARDRAILS.guards import GUARDRAILS_VERSION, check_output
 from source.RETRIEVAL.retriever import Retriever
+from source.TRACING.tracer import current_trace, span
 
 
 class GenerationFailed(RuntimeError):
@@ -79,12 +80,12 @@ class QAPipeline:
         with self._lock:
             chunks = self._search(question, max(cfg.top_k, cfg.retry_top_k), rerank=True)
             used = chunks[:cfg.top_k]
-            result = self.generator.generate(question, used)
+            result = self._generate(question, used, "llm.answer")
             retried = False
             if (result["answer"] != "ERROR" and is_not_found(result["answer"])
                     and cfg.retry_top_k > cfg.top_k and len(chunks) > cfg.top_k):
                 used, retried = chunks, True
-                result = self.generator.generate(question, used)
+                result = self._generate(question, used, "llm.retry_top10")
         if result["answer"] == "ERROR":
             raise GenerationFailed(result.get("error") or "LLM call failed")
         chunks_out = [public_chunk(c) for c in used]
@@ -104,7 +105,22 @@ class QAPipeline:
         }
 
     def _search(self, question: str, top_k: int, rerank: bool) -> list[dict]:
+        trace = current_trace()
+        if trace is not None and rerank:
+            trace.update(rerank_calls=trace.fields.get("rerank_calls", 0) + 1)
         return self.retriever.search(question, top_k=top_k, metadata_filter=True, rerank=rerank)
+
+    def _generate(self, question: str, chunks: list[dict], step: str) -> dict:
+        """One LLM call, traced as its own span with tokens and the answer's start."""
+        with span(step, chunks=len(chunks)) as s:
+            result = self.generator.generate(question, chunks)
+            s.set(input_tokens=result.get("input_tokens", 0),
+                  output_tokens=result.get("output_tokens", 0),
+                  answer_start=result["answer"][:60], error=result.get("error"))
+        trace = current_trace()
+        if trace is not None:
+            trace.add_tokens(result.get("input_tokens", 0), result.get("output_tokens", 0))
+        return result
 
     def close(self) -> None:
         self.retriever.close()
