@@ -154,6 +154,13 @@ Order agreed with the user; each step on its own branch + PR:
    cache hit, 400/422/429/502/503, traces, stats). Run: `python -m pytest -rx`.
    `.github/workflows/tests.yml` runs it on every push/PR (Python 3.10, CPU-only torch).
    `requirements-dev.txt` holds pytest.
+5b. ✅ **API extras** (`feat/api-extras`): in-memory LRU **query-embedding cache** in the
+   retriever (`EmbeddingCache`, 1,024 entries; live 1,422 ms → 0 ms for a repeated
+   question); **`GET /documents`** (41 companies / 368 filings, type, year, quarter, 8-K
+   filing date, `?company=` filter); **cost estimates** (`source/TRACING/costs.py`,
+   `cost_usd` per trace and in `/stats`; prices via `FILINGLENS_PRICE_*` env vars —
+   defaults are list-price estimates, trial keys are free). `/health` shows embedding-cache
+   stats and prices. Tests: 80 passed + 1 xfail.
 6. **Cleanup + setup guide**: the root and folder READMEs are still Week-0 templates
    (mention `01-DATA/`, pgvector, `ingest.py`) — rewrite to match reality; document how to
    get `data/RAW` and rebuild `data/PROCESSED` (no download script exists; `.gitignore`
