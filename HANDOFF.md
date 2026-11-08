@@ -165,8 +165,13 @@ Order agreed with the user; each step on its own branch + PR:
    (mention `01-DATA/`, pgvector, `ingest.py`) — rewrite to match reality; document how to
    get `data/RAW` and rebuild `data/PROCESSED` (no download script exists; `.gitignore`
    claims one does). The old `workflows/` folder is superseded by `.github/workflows/`.
-7. **Deployment**: Dockerfile + docker-compose; mount `data/PROCESSED/` (~2 GB) rather
-   than baking it in; secrets via env.
+7. ✅ **Docker** (`Dockerfile`, `docker-compose.yml`, guide in `deployment/README.md`):
+   python:3.10-slim + CPU torch (`torch==2.14.0+cpu` from the PyTorch index with PyPI as
+   extra index — PyTorch-only index broke on a torch dependency) + Qwen model baked in
+   (chown in the same layer, image ~4.2 GB) + `source/`. `data/PROCESSED` mounted read-only;
+   cache/traces in volume `filinglens-state`; keys from `.env`. Docker Desktop is a per-user
+   install (`%LOCALAPPDATA%\Programs\DockerDesktop`). Tested: healthy in ~20 s, /query
+   2.3 s, cached 3 ms, injection 400, cache survives restart, ~1 GB RAM.
 8. **Evaluation harness**: config-driven runs (`experiments/*.yaml`), a run registry,
    standard report, LLM judge validated against `manual_verdicts.json`, a small smoke set
    for CI. Then the separate AI-agent project, measured against 79.3%.

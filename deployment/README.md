@@ -14,7 +14,7 @@ The `Dockerfile` and `docker-compose.yml` are in the repository root.
 └────────────────────────────────────────────────────────────┘
 ```
 
-| In the image (~3 GB) | Outside the image |
+| In the image (~4 GB) | Outside the image |
 |---|---|
 | Code, Python dependencies, the Qwen query-embedding model | Indexes and chunks (`data/PROCESSED`, ~2 GB), API keys (`.env`), cache and traces (Docker volume) |
 
@@ -42,7 +42,7 @@ docker compose version
 docker compose up --build -d
 ```
 
-The first build downloads PyTorch and the Qwen model (several minutes, ~3 GB). Later builds
+The first build downloads PyTorch and the Qwen model (~3–5 minutes; image ~4 GB). Later builds
 reuse those layers; a code change rebuilds in seconds. After start, the API needs ~30–60 s to
 load the model and indexes.
 

@@ -20,23 +20,28 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # 1. Dependencies first, so code changes do not reinstall them.
-#    The CPU wheel avoids ~2 GB of CUDA libraries; it satisfies requirements.txt's torch pin.
+#    The CPU wheel ("+cpu", only on the PyTorch index) avoids ~2 GB of CUDA libraries and
+#    satisfies requirements.txt's torch pin. PyPI stays available for torch's own
+#    dependencies, which the PyTorch index does not always carry as wheels.
 COPY requirements.txt .
-RUN pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu \
+RUN pip install "torch==2.14.0+cpu" \
+        --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple \
  && pip install -r requirements.txt
+
+# Non-root user; /app/state holds cache.db and traces.db (a Docker volume).
+RUN useradd --create-home --uid 1000 app \
+ && mkdir -p /app/state /app/data/PROCESSED \
+ && chown app:app /app/state
 
 # 2. Bake the query-embedding model into the image (~1.2 GB), so the container starts
 #    without downloading it and works offline apart from the Cerebras / Cohere calls.
+#    Ownership is set in the same layer: a separate chown would store the model twice.
 RUN python -c "from sentence_transformers import SentenceTransformer; \
-SentenceTransformer('Qwen/Qwen3-Embedding-0.6B')"
+SentenceTransformer('Qwen/Qwen3-Embedding-0.6B')" \
+ && chown -R app:app /opt/hf-cache
 
 # 3. Application code. Indexes, caches and traces live outside the image.
 COPY source/ source/
-
-# Run as a non-root user; /app/state holds cache.db and traces.db (a Docker volume).
-RUN useradd --create-home --uid 1000 app \
- && mkdir -p /app/state /app/data/PROCESSED \
- && chown -R app:app /app/state /opt/hf-cache
 USER app
 
 ENV FILINGLENS_CACHE_PATH=/app/state/cache.db \
