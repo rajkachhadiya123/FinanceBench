@@ -1,0 +1,21 @@
+# Only requirements.txt and source/ are copied into the image; keep the build context small
+# and never send data, secrets or virtual environments to the Docker daemon.
+.git
+.github
+.venv
+venv
+.env
+.env.*
+!.env.example
+data
+documentation
+analysis
+experiments
+tests
+tools
+.claude
+.kilo
+**/__pycache__
+**/*.py[cod]
+*.log
+.pytest_cache

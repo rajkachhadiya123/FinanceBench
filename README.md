@@ -70,6 +70,8 @@ copy .env.example .env            # then fill in CEREBRAS_API_KEY and COHERE_API
 python -m uvicorn source.API.app:app --port 8000
 ```
 
+**Or with Docker:** `docker compose up --build -d` — see [deployment/README.md](deployment/README.md).
+
 Startup takes ~30–60 s (the embedding model and indexes load once). Then open
 **http://127.0.0.1:8000/docs**, or:
 
@@ -159,7 +161,7 @@ data/           EVAL (questions, in git) · RAW (PDFs) · PROCESSED (indexes, gi
 documentation/  experiment log, limitations, early retrieval reports
 analysis/       early exploration scripts
 experiments/    reserved for evaluation-harness configs (not built yet)
-deployment/     reserved for Docker (not built yet)
+deployment/     Docker guide (Dockerfile and docker-compose.yml are in the root)
 ```
 
 ## Documentation
@@ -173,5 +175,5 @@ deployment/     reserved for Docker (not built yet)
 
 ## Status
 
-Accuracy work is closed at 79.3%. Not built yet: an evaluation harness (config-driven runs with
-an automatic judge), Docker packaging, and an AI-agent layer on top of the API.
+Accuracy work is closed at 79.3%. The API runs locally with Python or Docker. Not built yet:
+an evaluation harness (config-driven runs with an automatic judge) and an AI-agent layer on top of the API.
