@@ -1,4 +1,4 @@
-# Large data files (re-downloadable via download script, see data/README.md)
+# Large data files: PDFs and built indexes (how to get and rebuild them: data/README.md)
 data/RAW/
 data/PROCESSED/
 

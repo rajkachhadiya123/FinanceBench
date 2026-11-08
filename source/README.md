@@ -1,123 +1,64 @@
-# 02-CODE: Source Code
+# source
 
-The application code organized by pipeline stage. Each module is independent and tested.
-
-## 🔄 Pipeline Stages
+Application code, one folder per pipeline stage. The API in `API/` wires them together.
 
 ```
-Question → [INGESTION] → [RETRIEVAL] → [GENERATION] → [GUARDRAILS] → Answer + Traces
-             (Week 1)      (Week 3)      (Week 4)      (Week 4)       (Week 5)
+INGESTION → RETRIEVAL → GENERATION        (the question-answering pipeline)
+GUARDRAILS · TRACING · SHARED             (around every API request)
+API                                       (FastAPI service)
 ```
 
-## 📂 Modules
+## INGESTION/ — PDFs to indexes (offline)
 
-### `INGESTION/` — Load & Process PDFs
-**Week 1 deliverable: v0.1.0**
+| File | Role |
+|---|---|
+| `chunker.py` | PDF text (PyMuPDF) → fixed 2,000-character chunks with 300 overlap, page-tracked → `chunks.jsonl` |
+| `embedder.py` | MiniLM embeddings + `faiss.index`; also writes `chunk_meta.jsonl` (byte offsets into `chunks.jsonl`) |
+| `embedder2.py` | BGE-base constants and index builder (retired) |
+| `embedder3.py` | **Qwen3-Embedding-0.6B** constants (incl. the query instruction) and index builder; `--headed` builds the index for the headed chunks |
+| `bm25_builder.py` | BM25 keyword index (bm25s, English stopwords + Snowball stemmer); `--headed` for the headed chunks |
 
-Reads PDFs, extracts text, chunks into smaller pieces, and prepares for embedding.
+Contract: position N means the same chunk in every index and metadata file.
 
-**Key files**:
-- `pdf_parser.py` — Extract text by page from PDFs
-- `text_cleaner.py` — Normalize text (remove duplicates, fix encoding)
-- `chunker.py` — Split into chunks (recursive, structure-aware)
-- `metadata_extractor.py` — Company, year, doc type, section labels
+## RETRIEVAL/
 
-**Output**: `../01-DATA/PROCESSED/chunks.jsonl`
+| File | Role |
+|---|---|
+| `metadata_filter.py` | Company and fiscal year(s) from the question text → the filings to search (or none = search all) |
+| `retriever.py` | Hybrid search: dense (FAISS) + BM25, Reciprocal Rank Fusion, optional rerank; query-embedding LRU cache; per-embedding settings in `EMBEDDINGS` (`qwen_headed` is the one the API uses) |
+| `cohere_reranker.py` | Cohere Rerank API client (handles the trial key's per-minute limit) |
 
-### `RETRIEVAL/` — Search & Rank
-**Week 3 deliverable: v0.3.0**
+## GENERATION/
 
-Given a question, find the most relevant pages from the PDFs.
+| File | Role |
+|---|---|
+| `answer_generator.py` | Cerebras `gpt-oss-120b` over HTTP; `PROMPT_TEMPLATE` (v2, active), v1 and v4 kept for reference; parses REASONING / FINAL ANSWER / CITATIONS; waits out rate limits |
 
-**Key files**:
-- `embedding_store.py` — Query dense vector search (pgvector)
-- `keyword_search.py` — BM25 full-text search
-- `hybrid_retriever.py` — Combine dense + keyword with rank fusion
-- `reranker.py` — Cross-encoder reranking (top-5)
-- `metadata_filter.py` — Extract company/year from question
+## GUARDRAILS/
 
-**Input**: Question string
-**Output**: List of (page_number, text, score) tuples
+| File | Role |
+|---|---|
+| `guards.py` | `check_input` (blocks hidden characters, unreadable text, repeated characters/words, prompt-injection patterns), `check_output` (share of figures traceable to the sources, retrieval confidence), investment-advice disclaimer |
+| `rate_limit.py` | Per-client sliding-window rate limiter |
 
-### `GENERATION/` — Generate Answers
-**Week 4 deliverable: v0.4.0**
+## TRACING/
 
-Takes retrieved pages and uses an LLM to generate an answer with citations.
+| File | Role |
+|---|---|
+| `tracer.py` | `start_trace()` / `span()` and `TraceStore` (SQLite `traces.db`, 30-day retention, stats) |
+| `costs.py` | Estimated USD per request from tokens and rerank calls (prices via env) |
 
-**Key files**:
-- `prompt_builder.py` — Format retrieved context for LLM
-- `answer_generator.py` — Call Groq API, extract citations
-- `calculator.py` — Optional tool: evaluate formulas (for numeric answers)
-- `citation_formatter.py` — Add page numbers to answers
+## SHARED/
 
-**Input**: Question + retrieved pages
-**Output**: Answer string with [Page X] citations
+| File | Role |
+|---|---|
+| `cache.py` | SQLite answer cache with exact, version-aware keys |
 
-### `GUARDRAILS/` — Validate Input & Output
-**Week 4 deliverable: v0.4.0**
+## API/
 
-Check for off-topic questions, prompt injection, and invalid answers.
+| File | Role |
+|---|---|
+| `pipeline.py` | `QAPipeline`: the final pipeline loaded once (filter → hybrid search → rerank → LLM → top-10 retry on NOT FOUND → output checks); document catalogue |
+| `app.py` | FastAPI app: endpoints, guardrail order, cache, tracing middleware |
 
-**Key files**:
-- `input_validator.py` — Reject off-topic, malicious questions
-- `output_grounding.py` — Verify answer text comes from retrieved pages
-- `confidence_checker.py` — Refuse low-confidence answers
-- `financial_safety.py` — Detect investment advice, disclaimer checking
-
-**Input**: Question (input validation) or Answer (output validation)
-**Output**: Pass/Fail + reason
-
-### `TRACING/` — Logging & Metrics
-**Week 5 deliverable: v0.5.0**
-
-Record latency, tokens used, cost per request, and detailed step traces.
-
-**Key files**:
-- `langfuse_client.py` — Initialize and configure Langfuse
-- `step_tracer.py` — Log each pipeline step (ingestion, retrieval, generation)
-- `cost_calculator.py` — Compute cost per LLM call
-- `metrics_reporter.py` — Format results for storage and display
-
-**Captured**:
-- Latency (p50, p95, p99)
-- Tokens (input, output, total)
-- Cost per question and per 1000 questions
-- Full trace hierarchy (question → steps → sub-steps)
-
-### `SHARED/` — Utilities
-Shared across all modules.
-
-**Key files**:
-- `config.py` — Load settings (database, API keys)
-- `database.py` — PostgreSQL + pgvector connection
-- `types.py` — Pydantic models (Chunk, Question, Answer, etc)
-- `logging.py` — Structured logging
-
-## 🧪 Testing
-
-Each module has corresponding tests in `../03-TESTS/UNIT/` and `../03-TESTS/INTEGRATION/`
-
-Example:
-- `02-CODE/INGESTION/chunker.py` → `03-TESTS/UNIT/test_chunker.py`
-- Full pipeline → `03-TESTS/INTEGRATION/test_end_to_end.py`
-
-## 🔌 Dependencies
-
-Install once in root:
-```bash
-pip install -r requirements.txt
-```
-
-Key libraries:
-- `fastapi` — Web API
-- `pydantic` — Data validation
-- `psycopg2-binary` — PostgreSQL
-- `pgvector` — Vector operations
-- `sentence-transformers` — Embeddings
-- `rank_bm25` — Keyword search
-- `groq` — LLM API client
-- `langfuse` — Tracing
-
----
-
-**Status**: Ready for Week 1 development
+Run the API from the repository root: `python -m uvicorn source.API.app:app --port 8000`.

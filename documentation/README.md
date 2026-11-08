@@ -1,65 +1,9 @@
-# 07-DOCS: Documentation
+# documentation
 
-Design, architecture, and decision records.
+| Document | Contents |
+|---|---|
+| [experiment_log/README.md](experiment_log/README.md) | The full history: V1 (MiniLM) → V2 (BGE) → V3 (Qwen + Cohere rerank + chunk headers), every measurement, end-to-end results on all 150 questions, prompt versions, failure analysis, ideas not pursued |
+| [LIMITATIONS.md](LIMITATIONS.md) | Honest assessment of the current system: where the remaining 31 failures come from, retrieval / generation / evaluation limitations, what is not built |
+| `reports/*.pdf` | Early retrieval reports (baseline, metadata filter, reranking, oracle) from `tools/evaluate_retrieval.py`. They predate the strict answer matcher, so their headline percentages are optimistic — the experiment log has the corrected numbers |
 
-## 📂 Files (to be created)
-
-### `ARCHITECTURE.md`
-System diagram and component overview.
-
-**Content**:
-- High-level pipeline diagram
-- Component responsibilities
-- Data flow (question → answer)
-- Database schema
-- API contract
-
-### `DECISIONS.md`
-Major decisions and trade-offs (Week 1+)
-
-**Format**: Date | Decision | Rationale | Alternatives Considered
-
-**Examples**:
-- Week 1: Why recursive chunking over fixed-size?
-- Week 3: Why rank fusion over pure semantic search?
-- Week 4: Why local reranker vs. API-based?
-
-### `LIMITATIONS.md`
-Known issues and honest failure analysis (Week 6)
-
-**Content**:
-- What the system handles well
-- Known failure modes
-- Open research questions
-- Future improvements
-
-### `RESULTS.md`
-Final metrics and before/after comparison (Week 6)
-
-**Tables**:
-- Version progression (v0.1 → v1.0)
-- Retrieval metrics by version
-- Answer accuracy improvement
-- Latency and cost breakdown
-
-### `API.md` (Week 5)
-API endpoint documentation.
-
-**Content**:
-- `POST /query` — Ask a question
-- `GET /health` — Health check
-- Request/response formats
-- Error codes
-
-### `DATA_GUIDE.md`
-Detailed information about the FinanceBench dataset.
-
-**Content**:
-- Question types and distribution
-- PDF metadata
-- Evidence format
-- Data quality notes
-
----
-
-**Status**: Start documentation in Week 1
+Working notes for continuing development are in [HANDOFF.md](../HANDOFF.md) at the repository root.

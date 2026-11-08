@@ -1,74 +1,18 @@
-# 06-DOCKER: Containerization
+# deployment
 
-Docker configuration for reproducible deployment.
+Reserved for **Docker** packaging — not built yet.
 
-## 📂 Files
-
-### `Dockerfile`
-Builds the application image with all dependencies.
+Today the API runs directly with Python (see the [root README](../README.md#quick-start)):
 
 ```bash
-docker build -t filinglens:latest .
-docker run -p 8000:8000 filinglens:latest
+python -m uvicorn source.API.app:app --port 8000
 ```
 
-### `docker-compose.yml` (Week 5)
-One-command setup: PostgreSQL + pgvector + FastAPI + Langfuse
+The plan for a container:
 
-```bash
-docker-compose up -d
-```
-
-**Containers**:
-- `postgres` — Database with pgvector
-- `app` — FastAPI server
-- `langfuse` — Tracing (optional)
-
-### `.dockerignore`
-Exclude unnecessary files from build (node_modules, tests, etc)
-
-## 🚀 Quick Start
-
-**Week 5 - Run Full System**:
-
-```bash
-cd 06-DOCKER
-docker-compose up -d
-
-# Check status
-docker-compose ps
-
-# View logs
-docker-compose logs -f app
-
-# Stop
-docker-compose down
-```
-
-**Access**:
-- API: http://localhost:8000
-- Docs: http://localhost:8000/docs
-- Database: localhost:5432
-- Langfuse: http://localhost:3000 (if enabled)
-
-## 🔧 Configuration
-
-Environment variables in `docker-compose.yml`:
-
-```yaml
-environment:
-  DATABASE_URL: postgresql://postgres:password@postgres:5432/filinglens
-  GROQ_API_KEY: ${GROQ_API_KEY}
-  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
-  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
-```
-
-Set in shell before running:
-```bash
-export GROQ_API_KEY=your_key_here
-docker-compose up
-```
-
----
-
-**Status**: Ready for Week 5
+- a `Dockerfile` with the Python dependencies (CPU-only PyTorch) and the `source/` code;
+- `data/PROCESSED/` (~2 GB of indexes) **mounted as a volume**, not copied into the image;
+- API keys passed from `.env` at run time (`--env-file`), never baked into the image;
+- `cache.db` and `traces.db` on the mounted volume so they survive container restarts;
+- one API process per container — the SQLite cache and the in-memory rate limiter are per
+  process, so several replicas would need a shared store (e.g. Redis).
