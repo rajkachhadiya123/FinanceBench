@@ -30,3 +30,9 @@ Thumbs.db
 .vscode/
 .idea/
 .kilo/
+
+# graphify: keep graph.json, GRAPH_REPORT.md, graph.html and manifest.json;
+# ignore its extraction cache and machine-specific helper files
+graphify-out/cache/
+graphify-out/.graphify_*
+graphify-out/cost.json
