@@ -1,64 +1,36 @@
-# 03-TESTS: Test Suite
-
-Automated tests to ensure code quality and catch regressions.
-
-## 📂 Structure
-
-### `UNIT/` — Module Tests
-Test individual functions in isolation (Week 1+)
-
-**Examples**:
-- `test_pdf_parser.py` — PDF text extraction
-- `test_chunker.py` — Text chunking logic
-- `test_embedding_store.py` — Vector similarity search
-- `test_guardrails.py` — Input/output validation
-
-**Run**: `pytest 03-TESTS/UNIT/ -v`
-
-### `INTEGRATION/` — Pipeline Tests
-Test the full pipeline end-to-end (Week 2+)
-
-**Examples**:
-- `test_ingest_to_search.py` — Ingest → Query → Retrieve
-- `test_qa_pipeline.py` — Question → Answer with metrics
-- `test_api_endpoints.py` — FastAPI endpoints
-- `test_guardrails_e2e.py` — Full guardrail flow
-
-**Run**: `pytest 03-TESTS/INTEGRATION/ -v`
-
-## 🎯 Coverage Goals
-
-- **Unit tests**: 80%+ coverage per module (Week 2)
-- **Integration tests**: All major workflows (Week 2)
-- **Evaluation tests**: 150 benchmark questions (Week 2+)
-
-## 🚀 Running Tests
+# tests
 
 ```bash
-# All tests
-pytest 03-TESTS/ -v
-
-# Specific module
-pytest 03-TESTS/UNIT/test_chunker.py -v
-
-# With coverage
-pytest 03-TESTS/ --cov=02-CODE --cov-report=html
-
-# Fast mode (skip integration)
-pytest 03-TESTS/UNIT/ -v
+python -m pip install -r requirements-dev.txt
+python -m pytest -rx
 ```
 
-## ⚡ CI/CD Integration
+80 tests in about 11 seconds. They need **no API keys, no network and no `data/PROCESSED/`**:
+external services are replaced by fakes and every database is a temporary file. Only
+`data/EVAL/` (the 150 benchmark questions, tracked in git) is read. GitHub Actions runs the
+same command on every push and pull request (`.github/workflows/tests.yml`).
 
-Tests run on every PR via GitHub Actions (Week 5):
-- Linting with `flake8`
-- Type checking with `mypy`
-- Unit tests
-- Integration tests
-- Evaluation gate (must not decrease accuracy)
+## UNIT/
 
-See `../09-CI/` for workflow files.
+| File | Covers |
+|---|---|
+| `test_metadata_filter.py` | Company names, short names, abbreviations, finance jargon, renamed companies, multi-year questions, fallbacks |
+| `test_pipeline_helpers.py` | Reciprocal Rank Fusion, chunk-header splitting, public chunk shape, NOT FOUND detection |
+| `test_guards.py` | **None of the 150 benchmark questions is blocked**; attacks are blocked; tricky legitimate questions pass; figure grounding; confidence threshold; disclaimer |
+| `test_cache_and_rate_limit.py` | Cache keys and normalization, round trip, no expiry; rate limiter per client and window |
+| `test_tracer.py` | Spans across worker threads, error recording, retention purge, stats, a failed save never breaking a request |
+| `test_answer_parsing.py` | Parsing of the LLM reply, context labels, formula check |
+| `test_chunk_headers.py` | Heading detection for items, statements, notes, parent-company schedules; table-of-contents pages ignored |
+| `test_api_extras.py` | Query-embedding LRU cache, document catalogue, cost estimate |
 
----
+## INTEGRATION/
 
-**Status**: Ready for Week 1
+| File | Covers |
+|---|---|
+| `test_api.py` | The real FastAPI app with a fake pipeline: cache hit, `use_cache=false`, HTTP 400 / 422 / 429 / 502 / 503, `X-Request-ID`, traces, `/stats`, `/documents`, cost per request, `DELETE /cache` |
+
+## Expected failure
+
+`test_var_does_not_resolve_to_activision` is marked `xfail(strict=True)`: it documents a known
+metadata-filter bug ("VaR" in a JPMorgan question matches Activision). If the bug is fixed the
+test starts passing, pytest reports it, and the marker should be removed.

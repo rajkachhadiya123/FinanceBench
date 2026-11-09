@@ -1,84 +1,37 @@
-# 05-SCRIPTS: Command-Line Tools
+# tools
 
-Ready-to-use CLI scripts for common tasks.
+Command-line scripts for evaluation and data preparation. Run them from the repository root
+(`python tools/<script>.py`). Scripts that call Cerebras or Cohere need the keys in `.env`.
 
-## 🛠️ Main Scripts
+## Evaluation
 
-### `ingest.py` — Load & Process PDFs
-**Week 1**
+| Script | What it measures | API cost |
+|---|---|---|
+| `test_answers.py` | **End-to-end answers**: retrieval → rerank → LLM → automatic grading of numeric answers. Answers are appended to `data/PROCESSED/answer_results.jsonl` and reused on reruns (tagged by model, retrieval, prompt, reasoning effort) | ~1–2 Cerebras + 1 Cohere call per uncached question |
+| `evaluate_reranker.py` | **Retrieval only** on the 71 questions whose answer is written in the filing (43 tune / 28 holdout): answer chunk in the top 1/3/5/10, MRR, McNemar test against the baseline | 1 Cohere call per question, cached |
+| `compare_answer_runs.py` | Compares two end-to-end runs question by question using `manual_verdicts.json`; `--pending` lists answers that still need a human verdict | none |
+| `evaluate_guardrails.py` | Input guards on all 150 questions plus attack and tricky-legitimate sets; output signals on the 150 graded answers | Cohere only for scores not yet cached |
+| `evaluate_retrieval.py` | Older retrieval evaluator that wrote the PDF reports in `documentation/reports/`. Its default answer matcher is lenient — use `evaluate_reranker.py` for numbers | none |
 
-Reads all PDFs from `01-DATA/RAW/`, chunks them, and stores in database.
-
-```bash
-python ingest.py \
-  --pdf-dir ../01-DATA/RAW \
-  --output ../01-DATA/PROCESSED \
-  --chunk-size 512 \
-  --strategy recursive
-```
-
-**Output**: Chunks in PostgreSQL + pgvector index
-
-### `query.py` — Search Database
-**Week 2**
-
-Search for relevant pages given a question.
+Common commands:
 
 ```bash
-python query.py \
-  --question "What is FY2022 revenue?" \
-  --top-k 5
+# the 79.3% run (all 150 questions, top 5, retry with top 10 on NOT FOUND)
+python tools/test_answers.py --include-holdout --n 200 --top-k 5 --retry-top-k 10 --no-targeted --embedding qwen_headed
+
+# re-run only chosen questions (one financebench_id per line)
+python tools/test_answers.py --include-holdout --n 200 --embedding qwen_headed --ids my_ids.txt
+
+# retrieval, headed chunks vs the original chunks
+python tools/evaluate_reranker.py --embedding qwen_headed
 ```
 
-**Output**: Top K pages with scores
+## Data preparation
 
-### `evaluate.py` — Run Full Evaluation
-**Week 2+**
+| Script | Role |
+|---|---|
+| `add_chunk_headers.py` | Prefixes every chunk with `[COMPANY \| TYPE \| PERIOD \| page N \| section]` → `chunks_headed.jsonl` + `.zip`. `--sample` prints a review sample without writing |
+| `colab_embed_qwen.py` | Google Colab (T4 GPU) script that embeds a chunk zip with Qwen3-Embedding-0.6B; resumable via Google Drive |
+| `colab_embed_bge.ipynb`, `build_bge_index.py` | The same for BGE-base (retired) |
 
-Run the system on all 150 benchmark questions and measure accuracy.
-
-```bash
-python evaluate.py \
-  --config ../04-CONFIG/v0.3_retrieval.yaml \
-  --dataset ../01-DATA/EVAL/financebench_open_source.jsonl \
-  --output ../01-DATA/PROCESSED/results_v0.3.json
-```
-
-**Output**: JSON with metrics (hit@k, accuracy, latency, cost)
-
-### `compare_versions.py` — Compare Results
-**Week 3+**
-
-Compare metrics across versions and run statistical tests.
-
-```bash
-python compare_versions.py \
-  --versions v0.1 v0.2 v0.3 \
-  --metric accuracy
-```
-
-**Output**: CSV table with results and McNemar test p-values
-
-### `serve.py` — Start FastAPI Server
-**Week 5**
-
-Run the production API locally.
-
-```bash
-python serve.py --port 8000
-```
-
-**API endpoint**: `POST /query` with question JSON
-
-### `trace.py` — View Traces
-**Week 5**
-
-Display latency and cost breakdowns from Langfuse.
-
-```bash
-python trace.py --question-id abc123
-```
-
----
-
-**Status**: Ready for Week 1
+The full rebuild order is in [data/README.md](../data/README.md).

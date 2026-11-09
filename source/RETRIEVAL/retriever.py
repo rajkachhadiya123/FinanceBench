@@ -16,6 +16,8 @@ chunks.jsonl in file order.
 """
 import json
 import sys
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 import bm25s
@@ -32,6 +34,7 @@ from source.INGESTION import embedder, embedder3  # noqa: E402
 # import and the "bge" entry in EMBEDDINGS below.
 # from source.INGESTION import embedder2  # noqa: E402
 from source.RETRIEVAL.metadata_filter import MetadataFilter  # noqa: E402
+from source.TRACING.tracer import span  # noqa: E402  (no-op outside a traced request)
 PROCESSED = ROOT / "data" / "PROCESSED"
 CHUNKS_PATH = PROCESSED / "chunks.jsonl"
 META_PATH = PROCESSED / "chunk_meta.jsonl"
@@ -92,6 +95,48 @@ STATEMENT_HINTS = {
 RERANK_CANDIDATES = {"local": 20, "cohere": 40}
 
 
+EMBEDDING_CACHE_SIZE = 1024  # query vectors kept in memory (1024 x 1024 floats ~ 4 MB)
+
+
+class EmbeddingCache:
+    """
+    Least-recently-used cache of query vectors, keyed by the exact text embedded.
+
+    Query embedding is the slowest retrieval step on CPU (~1 s for Qwen, measured by
+    tracing), and the same text is often embedded again: /query and /retrieve on one
+    question, use_cache=false re-runs, retrieve calls with a different top_k or rerank
+    setting, and an agent repeating a search. Exact text only -- a different wording
+    is a different vector.
+    """
+
+    def __init__(self, max_size: int = EMBEDDING_CACHE_SIZE):
+        self.max_size = max_size
+        self._items: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = self.misses = 0
+
+    def get(self, text: str) -> np.ndarray | None:
+        with self._lock:
+            vec = self._items.get(text)
+            if vec is None:
+                self.misses += 1
+                return None
+            self._items.move_to_end(text)
+            self.hits += 1
+            return vec
+
+    def put(self, text: str, vec: np.ndarray) -> None:
+        with self._lock:
+            self._items[text] = vec
+            self._items.move_to_end(text)
+            while len(self._items) > self.max_size:
+                self._items.popitem(last=False)
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"entries": len(self._items), "hits": self.hits, "misses": self.misses}
+
+
 class Retriever:
     def __init__(self, use_reranker: bool | str = False, embedding: str = DEFAULT_EMBEDDING):
         """
@@ -103,6 +148,7 @@ class Retriever:
         spec = EMBEDDINGS[embedding]
         print(f"Loading indexes (dense: {spec['model']}) ...")
         self.embedder = SentenceTransformer(spec["model"])
+        self.embedding_cache = EmbeddingCache()
         self.query_prefix = spec["query_prefix"]
         self.stemmer = Stemmer.Stemmer("english")
         self.embedding = embedding
@@ -163,7 +209,9 @@ class Retriever:
             # company/year extraction could reach.
             allowed_positions = self._positions_for_docs({oracle_doc})
         elif metadata_filter:
-            allowed_positions = self._allowed_positions(query)
+            with span("retrieval.filter") as s:
+                allowed_positions = self._allowed_positions(query)
+                s.set(chunks_kept=None if allowed_positions is None else len(allowed_positions))
 
         queries = [query]
         if targeted:
@@ -175,17 +223,27 @@ class Retriever:
         for sub_query in queries:
             ranked_lists.append(self._dense_search(sub_query, CANDIDATES_K, allowed_positions))
             ranked_lists.append(self._bm25_search(sub_query, CANDIDATES_K, allowed_positions))
-        fused = self._rrf_fuse(ranked_lists)
+        with span("retrieval.rrf") as s:
+            fused = self._rrf_fuse(ranked_lists)
+            s.set(candidates=len(fused))
 
         if dedup:
             fused = self._drop_overlapping(fused)
 
+        scores: dict[int, float] = {}
         if rerank:
             if self.reranker is None:
                 raise RuntimeError("Retriever was built with use_reranker=False.")
-            fused = self._rerank(query, fused, top_k)
+            with span(f"rerank.{self.reranker_kind}") as s:
+                fused, scores = self._rerank(query, fused, top_k)
+                s.set(docs=len(scores), best=round(max(scores.values()), 4) if scores else None)
 
-        return [self._build_result(pos, rank) for rank, pos in enumerate(fused[:top_k], 1)]
+        results = [self._build_result(pos, rank) for rank, pos in enumerate(fused[:top_k], 1)]
+        for result in results:
+            # Cohere relevance in [0, 1] (raw logit for the local cross-encoder);
+            # None for candidates beyond the rerank limit or when not reranked.
+            result["rerank_score"] = scores.get(result["position"])
+        return results
 
     @staticmethod
     def _statement_queries(query: str) -> list[str]:
@@ -220,15 +278,24 @@ class Retriever:
         # normalize_embeddings must match how chunks were embedded, or the
         # inner-product index returns meaningless distances. The prefix is
         # query-side only (empty for MiniLM; BGE's retrieval instruction).
-        vec = self.embedder.encode(
-            [self.query_prefix + query], convert_to_numpy=True, normalize_embeddings=True
-        ).astype(np.float32)
+        with span("retrieval.embed") as s:
+            text = self.query_prefix + query
+            vec = self.embedding_cache.get(text)
+            s.set(cached=vec is not None)
+            if vec is None:
+                vec = self.embedder.encode(
+                    [text], convert_to_numpy=True, normalize_embeddings=True
+                ).astype(np.float32)
+                self.embedding_cache.put(text, vec)
 
         params = None
         if allowed is not None:
             params = faiss.SearchParameters(sel=faiss.IDSelectorBatch(allowed))
-        _scores, positions = self.faiss_index.search(vec, k, params=params)
-        return [int(p) for p in positions[0] if p >= 0]
+        with span("retrieval.dense") as s:
+            _scores, positions = self.faiss_index.search(vec, k, params=params)
+            hits = [int(p) for p in positions[0] if p >= 0]
+            s.set(hits=len(hits))
+        return hits
 
     def _bm25_search(self, query: str, k: int, allowed: np.ndarray | None = None) -> list[int]:
         # Same stopwords + stemmer as bm25_builder.py, so query terms map onto
@@ -244,10 +311,13 @@ class Retriever:
             mask = self._mask_buffer
             k = min(k, len(allowed))
 
-        positions, _scores = self.bm25.retrieve(
-            tokens, k=k, weight_mask=mask, show_progress=False
-        )
-        return [int(p) for p in positions[0]]
+        with span("retrieval.bm25") as s:
+            positions, _scores = self.bm25.retrieve(
+                tokens, k=k, weight_mask=mask, show_progress=False
+            )
+            hits = [int(p) for p in positions[0]]
+            s.set(hits=len(hits))
+        return hits
 
     @staticmethod
     def _rrf_fuse(ranked_lists: list[list[int]], k: int = RRF_K) -> list[int]:
@@ -280,7 +350,7 @@ class Retriever:
     def _chunk_index(chunk_id: str) -> int:
         return int(chunk_id.rsplit("__", 1)[1])
 
-    def _rerank(self, query: str, positions: list[int], top_k: int) -> list[int]:
+    def _rerank(self, query: str, positions: list[int], top_k: int) -> tuple[list[int], dict[int, float]]:
         """
         Re-score candidates by reading query and chunk text together.
 
@@ -299,7 +369,8 @@ class Retriever:
             scores = self.reranker.predict([(query, d) for d in documents],
                                            show_progress_bar=False)
         order = np.argsort(scores)[::-1]
-        return [candidates[i] for i in order] + rest
+        by_position = {candidates[i]: float(scores[i]) for i in range(len(candidates))}
+        return [candidates[i] for i in order] + rest, by_position
 
     def _rerank_document(self, position: int) -> str:
         """

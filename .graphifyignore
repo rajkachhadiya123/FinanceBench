@@ -1,0 +1,9 @@
+# Extra exclusions for the graphify knowledge graph (.gitignore is honored too, so
+# data/RAW, data/PROCESSED, .venv and .env are already out). Keep the graph to the
+# code and its documentation.
+data/
+documentation/reports/
+graphify-out/
+.claude/
+.kilo/
+.github/

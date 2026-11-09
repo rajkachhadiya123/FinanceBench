@@ -1,0 +1,24 @@
+# Run the FilingLens API locally:   docker compose up --build
+# Then open http://localhost:8000/docs
+services:
+  api:
+    build: .
+    image: filinglens-api:latest
+    container_name: filinglens-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env                      # CEREBRAS_API_KEY, COHERE_API_KEY (+ optional settings)
+    environment:
+      # These must point inside the container; they override any value in .env.
+      FILINGLENS_CACHE_PATH: /app/state/cache.db
+      FILINGLENS_TRACE_PATH: /app/state/traces.db
+    volumes:
+      # Indexes and chunks (~2 GB), read-only. Built as described in data/README.md.
+      - ./data/PROCESSED:/app/data/PROCESSED:ro
+      # Answer cache and traces, kept across restarts.
+      - filinglens-state:/app/state
+    restart: unless-stopped
+
+volumes:
+  filinglens-state:

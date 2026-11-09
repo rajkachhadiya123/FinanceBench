@@ -1,74 +1,94 @@
-# 06-DOCKER: Containerization
+# deployment — running FilingLens in Docker
 
-Docker configuration for reproducible deployment.
+The `Dockerfile` and `docker-compose.yml` are in the repository root.
 
-## 📂 Files
+```
+┌──────────────── container: filinglens-api ────────────────┐
+│ Python 3.10 · CPU-only PyTorch · source/ · Qwen model      │
+│ uvicorn source.API.app:app  →  port 8000                   │
+│                                                            │
+│ /app/data/PROCESSED  ◄── ./data/PROCESSED  (read-only)     │
+│ /app/state           ◄── volume "filinglens-state"         │
+│                          (cache.db, traces.db)             │
+│ API keys             ◄── .env  (at run time, never baked)  │
+└────────────────────────────────────────────────────────────┘
+```
 
-### `Dockerfile`
-Builds the application image with all dependencies.
+| In the image (~4 GB) | Outside the image |
+|---|---|
+| Code, Python dependencies, the Qwen query-embedding model | Indexes and chunks (`data/PROCESSED`, ~2 GB), API keys (`.env`), cache and traces (Docker volume) |
+
+## 1. Install Docker (once)
+
+Windows: install **Docker Desktop** (https://www.docker.com/products/docker-desktop/ or
+`winget install Docker.DockerDesktop` from an administrator terminal), restart when asked,
+start Docker Desktop and keep the WSL 2 backend enabled. Check in a new terminal:
 
 ```bash
-docker build -t filinglens:latest .
-docker run -p 8000:8000 filinglens:latest
+docker --version
+docker compose version
 ```
 
-### `docker-compose.yml` (Week 5)
-One-command setup: PostgreSQL + pgvector + FastAPI + Langfuse
+## 2. Prerequisites in the project folder
+
+- `.env` with `CEREBRAS_API_KEY` and `COHERE_API_KEY` (copy `.env.example`).
+- `data/PROCESSED/` with the headed indexes (see [data/README.md](../data/README.md)):
+  `faiss_qwen_headed.index`, `chunks_headed.jsonl`, `chunk_meta_headed.jsonl`, `bm25_index_headed/`.
+  If the project is in OneDrive, make sure these files are kept on the device, not online-only.
+
+## 3. Build and start
 
 ```bash
-docker-compose up -d
+docker compose up --build -d
 ```
 
-**Containers**:
-- `postgres` — Database with pgvector
-- `app` — FastAPI server
-- `langfuse` — Tracing (optional)
-
-### `.dockerignore`
-Exclude unnecessary files from build (node_modules, tests, etc)
-
-## 🚀 Quick Start
-
-**Week 5 - Run Full System**:
+The first build downloads PyTorch and the Qwen model (~3–5 minutes; image ~4 GB). Later builds
+reuse those layers; a code change rebuilds in seconds. After start, the API needs ~30–60 s to
+load the model and indexes.
 
 ```bash
-cd 06-DOCKER
-docker-compose up -d
-
-# Check status
-docker-compose ps
-
-# View logs
-docker-compose logs -f app
-
-# Stop
-docker-compose down
+docker compose ps                  # STATUS shows "healthy" once the API is ready
+docker compose logs -f api         # follow the logs (Ctrl+C stops following, not the API)
 ```
 
-**Access**:
-- API: http://localhost:8000
-- Docs: http://localhost:8000/docs
-- Database: localhost:5432
-- Langfuse: http://localhost:3000 (if enabled)
+## 4. Use it
 
-## 🔧 Configuration
+Open **http://localhost:8000/docs**, or:
 
-Environment variables in `docker-compose.yml`:
-
-```yaml
-environment:
-  DATABASE_URL: postgresql://postgres:password@postgres:5432/filinglens
-  GROQ_API_KEY: ${GROQ_API_KEY}
-  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
-  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
-```
-
-Set in shell before running:
 ```bash
-export GROQ_API_KEY=your_key_here
-docker-compose up
+curl http://localhost:8000/health
+curl -X POST http://localhost:8000/query -H "Content-Type: application/json" \
+     -d "{\"question\": \"What was Nike's total revenue in FY2023?\"}"
 ```
 
----
+## 5. Stop, restart, update
 
-**Status**: Ready for Week 5
+| Task | Command |
+|---|---|
+| Stop | `docker compose down` (cache and traces are kept in the volume) |
+| Start again | `docker compose up -d` |
+| Rebuild after a code change | `docker compose up --build -d` |
+| Clear cache and traces too | `docker compose down -v` (deletes the volume) |
+| Disk used by images | `docker system df` |
+
+## Settings
+
+All optional settings from `.env.example` work in `.env` (rate limits, trace retention,
+prices, model names). `FILINGLENS_CACHE_PATH` and `FILINGLENS_TRACE_PATH` are fixed by
+`docker-compose.yml` to the volume inside the container.
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `FileNotFoundError` for an index at startup | `data/PROCESSED` is missing files, or OneDrive keeps them online-only |
+| Container exits, `CEREBRAS_API_KEY not set` / `COHERE_API_KEY not set` | `.env` missing or the keys are empty |
+| Killed while loading (exit code 137) | Not enough memory for Docker: give it at least 4 GB (Docker Desktop → Settings → Resources) |
+| Port 8000 already in use | Stop the locally running API, or change `"8000:8000"` to `"8001:8000"` |
+| Slow first answers | Normal: the query-embedding model runs on CPU (~1 s); repeated questions are cached |
+
+## Limits of this setup
+
+One API process per container. The answer cache (SQLite) and the rate limiter (memory) belong
+to that process, so running several replicas behind a load balancer would need a shared store
+such as Redis.

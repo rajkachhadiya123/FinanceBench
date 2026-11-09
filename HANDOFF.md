@@ -1,11 +1,11 @@
-# HANDOFF — read this first in a new chat
+# HANDOFF — full project notes
 
-**Purpose:** everything a new assistant session needs to continue this project without the
-previous conversation. Last updated: 2026-10-15. Keep it current at the end of each session.
+**Purpose:** the complete working record of this project — decisions, results, what was
+built and why — for the owner, and for Claude when it needs detail. Last updated:
+2026-11-08. Keep it current at the end of each session.
 
-> New session: read this file, then `documentation/experiment_log/README.md` (results
-> history) and `documentation/LIMITATIONS.md`. Then ask the user what to do next — the
-> plan is in **§8**.
+> A new Claude chat automatically reads **`CLAUDE.md`** (short: map, commands, rules) and
+> opens this file only when it needs the details. How a new chat finds things: **§10**.
 
 ---
 
@@ -17,9 +17,10 @@ earnings releases) of 40 US companies, 2015–2023. Data: `data/RAW/` (PDFs),
 `data/PROCESSED/` (chunks, indexes, results — gitignored). Windows PC, CPU only, Python
 venv `.venv`. Heavy embedding runs are done by the user on **Google Colab (T4 GPU)**.
 
-**Status: accuracy work is closed at 119/150 = 79.3% end-to-end (2026-10-15).** The user
-does not want more accuracy experiments; remaining work is engineering (§8). Afterwards
-the user plans a separate project: an AI agent that uses this pipeline as a tool.
+**Status: complete (2026-11-08).** Accuracy closed at 119/150 = 79.3% end-to-end
+(2026-10-15); the engineering steps in §8 are done — API, caches, guardrails, tracing,
+tests + CI, docs, Docker (running locally on port 8000). Next: a separate project, an AI
+agent that uses this API as a tool. Optional leftovers are listed at the end of §8.
 
 ## 2. Final pipeline (what runs today)
 ```
@@ -96,7 +97,8 @@ files were deleted after verifying the FAISS indexes hold identical vectors
 - **Git**: never commit to `main`. One branch per step (e.g. `docs/v3-results`,
   `feat/api`), commit there; the user pushes (`git push origin <branch>`) and merges via a
   GitHub pull request (use "Create a merge commit", not squash). The assistant's shell
-  cannot authenticate to GitHub.
+  cannot authenticate to GitHub. **Since 2026-11-04 the user handles git entirely: don't
+  remind about pushing, PRs or merge order — focus on building and testing locally.**
 - ⚠️ `Desktop\FinanceBenchh` (two h's) is an unrelated `git init` copy with a nested repo —
   pulling there fails with "unrelated histories". Only `Desktop\FinanceBench` is the real
   repo. `C:\Users\Admin` also contains an accidental empty `.git`.
@@ -110,8 +112,8 @@ files were deleted after verifying the FAISS indexes hold identical vectors
 - A full 150 run ≈ 45–60 min, ~0.6M Cerebras tokens, ~150–165 Cohere calls.
 - PowerShell writes `.env` with a UTF-8 BOM if edited with `Set-Content` — edit via Python.
 
-## 8. ▶ NEXT STEPS — engineering (accuracy work is closed)
-Order agreed with the user; each step on its own branch + PR:
+## 8. Engineering steps (all done) and what is left
+Built in this order after accuracy work closed; each step on its own branch:
 1. ✅ **Docs** (`docs/v3-results`): experiment log, LIMITATIONS.md, this file.
 2. ✅ **API** (`feat/api`): `source/API/app.py` (FastAPI) + `source/API/pipeline.py`
    (final pipeline, loaded once, calls serialized by a lock) + `source/SHARED/cache.py`
@@ -122,17 +124,70 @@ Order agreed with the user; each step on its own branch + PR:
    The fallback slices one reranked top-10 list, so it costs no second Cohere call.
    `requirements.txt` added (pinned). No Redis / Supabase: single process, static
    indexes — swap the cache class for Redis only when running several workers.
-3. **Guardrails**: input (off-topic, prompt injection, no company identified) and output
-   (answer numbers present in retrieved text, NOT FOUND/low-confidence flag, "not
-   investment advice" note). `source/GUARDRAILS/` is empty.
-4. **Tracing**: per-request latency per step, tokens, cost, retrieved chunk ids
-   (Langfuse or JSON logs). `source/TRACING/` is empty.
-5. **Deployment**: Dockerfile + docker-compose; mount `data/PROCESSED/` (~2 GB) rather
-   than baking it in; secrets via env.
-6. **Tests + CI**: unit tests (metadata filter, RRF, header detection, formula check),
-   a small end-to-end smoke test, GitHub Actions.
-7. **Cleanup**: the root and folder READMEs are still Week-0 templates (mention
-   `01-DATA/`, pgvector, `ingest.py`, Langfuse) — rewrite to match reality.
+3. ✅ **Guardrails** (`feat/guardrails`), rule-based, no LLM — `source/GUARDRAILS/`:
+   `guards.py` (input: hidden chars, unreadable text, repeated chars/words, narrow
+   prompt-injection regexes → HTTP 400; output signals only, answer never changed:
+   figure grounding vs retrieved text, Cohere `retrieval_confidence` / `low_confidence`
+   < 0.50, investment-advice disclaimer; no-company warning) and `rate_limit.py`
+   (per-client sliding window, 10 /query + 30 /retrieve per min, env-configurable → 429).
+   Retriever results now carry `rerank_score`. Validated by `tools/evaluate_guardrails.py`:
+   0/150 benchmark questions blocked, 14/14 attacks blocked, 10/10 tricky legit questions
+   passed; grounding flag 0/111 false alarms (threshold 0.35, page refs excluded) but it
+   also flags 0/19 wrong answers — wrong answers use real figures from the wrong row, so
+   it only catches invented numbers; confidence: every answered benchmark question ≥ 0.816,
+   out-of-scope questions 0.28–0.39. Observation: for "is X a good investment" the LLM
+   still answers Yes/No — the disclaimer is attached, the prompt was not changed.
+4. ✅ **Tracing** (`feat/tracing`): `source/TRACING/tracer.py` — `start_trace()` / `span()`
+   (context variable, works across FastAPI worker threads, no-op outside a request),
+   `TraceStore` in a separate `data/PROCESSED/traces.db` (traces + spans; metadata only,
+   200-char answer preview + cache key; **30-day retention**, `FILINGLENS_TRACE_RETENTION_DAYS`;
+   cached answers keep no expiry; a failed save never breaks a request). API middleware
+   traces `/query` and `/retrieve`, returns `X-Request-ID` + `trace_id`; spans for guards,
+   cache, filter/embed/dense/bm25/rrf, `rerank.cohere`, `llm.answer`, `llm.retry_top10`,
+   provider rate-limit waits. Endpoints `GET /traces`, `GET /traces/{id}`, `GET /stats`.
+   Live-tested on 9 requests; finding: Qwen query embedding on CPU (~1.0 s p50) is the
+   slowest step, more than Cohere (0.55 s) or the LLM (0.53 s). `cost_usd` is not
+   configured (no prices set) — tokens and call counts are recorded.
+5. ✅ **Tests + CI** (`feat/tests`): `pytest` — 74 tests + 1 xfail (the known VaR →
+   Activision filter bug, marked strict so a fix is noticed), ~11 s, no API keys, no
+   network, no `data/PROCESSED`. `tests/UNIT/` (metadata filter, RRF/helpers, guards incl.
+   "0 of 150 benchmark questions blocked", cache, rate limiter, tracer, answer parsing,
+   chunk headers) and `tests/INTEGRATION/test_api.py` (FastAPI with a fake pipeline:
+   cache hit, 400/422/429/502/503, traces, stats). Run: `python -m pytest -rx`.
+   `.github/workflows/tests.yml` runs it on every push/PR (Python 3.10, CPU-only torch).
+   `requirements-dev.txt` holds pytest.
+5b. ✅ **API extras** (`feat/api-extras`): in-memory LRU **query-embedding cache** in the
+   retriever (`EmbeddingCache`, 1,024 entries; live 1,422 ms → 0 ms for a repeated
+   question); **`GET /documents`** (41 companies / 368 filings, type, year, quarter, 8-K
+   filing date, `?company=` filter); **cost estimates** (`source/TRACING/costs.py`,
+   `cost_usd` per trace and in `/stats`; prices via `FILINGLENS_PRICE_*` env vars —
+   defaults are list-price estimates, trial keys are free). `/health` shows embedding-cache
+   stats and prices. Tests: 80 passed + 1 xfail.
+6. ✅ **Cleanup + setup guide**: every README rewritten to match the code (root README:
+   results, pipeline, quick start, API, config); `data/README.md` is the setup guide (where
+   to get the PDFs, index build order incl. the Colab step); `.env.example` added; the
+   placeholder `workflows/` and `meta/` folders removed; `.gitignore` comment fixed.
+7. ✅ **Docker** (`Dockerfile`, `docker-compose.yml`, guide in `deployment/README.md`):
+   python:3.10-slim + CPU torch (`torch==2.14.0+cpu` from the PyTorch index with PyPI as
+   extra index — PyTorch-only index broke on a torch dependency) + Qwen model baked in
+   (chown in the same layer, image ~4.2 GB) + `source/`. `data/PROCESSED` mounted read-only;
+   cache/traces in volume `filinglens-state`; keys from `.env`. Docker Desktop is a per-user
+   install (`%LOCALAPPDATA%\Programs\DockerDesktop`). Tested: healthy in ~20 s, /query
+   2.3 s, cached 3 ms, injection 400, cache survives restart, ~1 GB RAM.
+8. ✅ **Context setup for new chats**: project `CLAUDE.md` (auto-loaded map, commands,
+   rules) and a graphify knowledge graph in `graphify-out/` (code + docs, `data/` excluded
+   by `.graphifyignore`) — see §10. `documentation/LIMITATIONS.md` "not yet built" section
+   corrected (L-13..L-16 now describe the remaining engineering limits).
+
+**Optional leftovers** (not needed for "done"):
+- Evaluation harness: config-driven runs (`experiments/*.yaml`), run registry, standard
+  report, LLM judge validated against `manual_verdicts.json`, smoke set for CI.
+- VaR → Activision metadata-filter bug (strict xfail test documents it).
+- Back up `data/PROCESSED/answer_results.jsonl` and `manual_verdicts.json` (gitignored,
+  hold the graded 79.3% results, not regenerable without re-running and re-grading).
+- Optional prompt rule so "is X a good investment" is not answered Yes/No (user's call).
+- A self-correcting answer loop was discussed and **skipped by the user** (2026-11-07);
+  if revisited, prototype it on the 31 failures + ~30 correct questions before building.
 
 ## 9. Environment gotchas
 - Background processes started by the assistant die when the Claude Code session ends.
@@ -142,3 +197,21 @@ Order agreed with the user; each step on its own branch + PR:
 - Colab: tell the user to paste/run cells directly rather than through Gemini (it has
   rewritten code before). `colab_embed_qwen.py` checks token lengths on a sample only —
   tokenizing all chunks at once crashed Colab's RAM.
+- Docker Desktop is a per-user install: `docker` is on the saved user PATH, but a terminal
+  (or VS Code) opened before the install doesn't see it — restart VS Code, or add
+  `%LOCALAPPDATA%\Programs\DockerDesktop\resources\bin` to `$env:Path` for that window.
+- graphify runs from its own uv tool environment (`uv tool install graphifyy`; CLI at
+  `%APPDATA%\uv\tools\graphifyy\Scripts\graphify.exe`), not the project `.venv`.
+
+## 10. How a new chat finds things
+| Source | Loaded | Holds | Size (approx.) |
+|---|---|---|---|
+| `CLAUDE.md` (repo root) | **Automatically, every chat** | Project map, commands, the user's rules, how to use the graph | ~1–1.3K tokens |
+| Claude memory (`~/.claude/projects/<project>/memory/`, index `MEMORY.md`) | Index automatically; files when relevant | Cross-session preferences: git is the user's job; project complete | ~0.1K index (+~0.6K files) |
+| `HANDOFF.md` (this file) | On demand | Full decisions, results, engineering log | ~4–5K tokens |
+| `graphify-out/GRAPH_REPORT.md` | On demand | Graph summary: communities, hub nodes, surprising links | ~3.6–4.5K tokens |
+| `graphify-out/graph.json` via `graphify query "…"` | On demand | Answers "where is X / what calls Y" from the graph | a few hundred tokens per query |
+| `graphify-out/graph.html` | For people | Interactive map of the code and docs — open in a browser | — |
+
+Refresh the graph after changes: `/graphify . --update` (code-only changes need no LLM;
+changed docs need one small extraction pass). `graphify-out/cost.json` records tokens spent.

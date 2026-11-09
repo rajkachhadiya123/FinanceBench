@@ -96,18 +96,23 @@ holdout is too small to confirm small gains.
 (average vs ending inventory), an unusual figure (a spin-off cost of 77.78) or a
 judgement ("similar company"). They are left as failures rather than tuned for.
 
-## Not yet built
+## Engineering (built after accuracy work closed — remaining limits)
 
-**L-13. No guardrails** — no off-topic or prompt-injection checks, no check that the
-answer's numbers appear in the retrieved text, no confidence threshold, no financial
-advice disclaimer. `source/GUARDRAILS/` is empty.
+**L-13. Guardrails are rule-based.** Input checks block only clear abuse (hidden
+characters, unreadable text, narrow prompt-injection patterns); attackers using other
+phrasings can get through. The grounding signal catches invented figures but not a real
+figure taken from the wrong row — the model's most common calculation error. Retrieval
+confidence measures relevance, not whether the company is in the data (a company mentioned
+inside another filing scores high).
 
-**L-14. No API** — the pipeline runs from scripts; nothing is exposed as a service.
+**L-14. One API process.** The SQLite answer cache, the in-memory embedding cache and the
+rate limiter belong to one process; several replicas would need a shared store (e.g. Redis).
 
-**L-15. No tracing** — per-step latency, tokens and cost are printed by the test runner
-but not recorded per request. `source/TRACING/` is empty.
+**L-15. Cost figures are estimates.** `cost_usd` in traces uses list-price defaults
+(`source/TRACING/costs.py`), not the provider's bill; trial keys cost nothing.
 
-**L-16. No deployment, tests or CI** — no Dockerfile, no unit tests, no automated checks.
+**L-16. No evaluation harness.** Experiments are run with the scripts in `tools/` and
+free-text answers are graded by hand; there are no config-driven runs and no LLM judge.
 
 **L-17. Local files instead of a database.** FAISS and bm25s indexes on disk (~2 GB in
 `data/PROCESSED/`, gitignored), not PostgreSQL + pgvector. Fine for one user; no
