@@ -31,7 +31,7 @@ docker compose version
 
 ## 2. Prerequisites in the project folder
 
-- `.env` with `CEREBRAS_API_KEY` and `COHERE_API_KEY` (copy `.env.example`).
+- `.env` with `DEEPSEEK_API_KEY` and `COHERE_API_KEY` (copy `.env.example`).
 - `data/PROCESSED/` with the headed indexes (see [data/README.md](../data/README.md)):
   `faiss_qwen_headed.index`, `chunks_headed.jsonl`, `chunk_meta_headed.jsonl`, `bm25_index_headed/`.
   If the project is in OneDrive, make sure these files are kept on the device, not online-only.
@@ -82,7 +82,7 @@ prices, model names). `FILINGLENS_CACHE_PATH` and `FILINGLENS_TRACE_PATH` are fi
 | Symptom | Cause / fix |
 |---|---|
 | `FileNotFoundError` for an index at startup | `data/PROCESSED` is missing files, or OneDrive keeps them online-only |
-| Container exits, `CEREBRAS_API_KEY not set` / `COHERE_API_KEY not set` | `.env` missing or the keys are empty |
+| Container exits, `DEEPSEEK_API_KEY not set` / `COHERE_API_KEY not set` | `.env` missing or the keys are empty |
 | Killed while loading (exit code 137) | Not enough memory for Docker: give it at least 4 GB (Docker Desktop → Settings → Resources) |
 | Port 8000 already in use | Stop the locally running API, or change `"8000:8000"` to `"8001:8000"` |
 | Slow first answers | Normal: the query-embedding model runs on CPU (~1 s); repeated questions are cached |
