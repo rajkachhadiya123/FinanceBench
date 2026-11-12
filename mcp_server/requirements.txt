@@ -1,0 +1,4 @@
+# MCP server dependencies, on top of the project's requirements.txt.
+# Install: python -m pip install -r requirements.txt -r mcp_server/requirements.txt
+# SDK v2: FastMCP is now called MCPServer (from mcp.server.mcpserver import MCPServer).
+mcp[cli]==2.3.0

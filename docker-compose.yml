@@ -8,7 +8,7 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - .env                      # CEREBRAS_API_KEY, COHERE_API_KEY (+ optional settings)
+      - .env                      # DEEPSEEK_API_KEY, COHERE_API_KEY (+ optional settings)
     environment:
       # These must point inside the container; they override any value in .env.
       FILINGLENS_CACHE_PATH: /app/state/cache.db

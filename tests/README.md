@@ -5,7 +5,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -rx
 ```
 
-80 tests in about 11 seconds. They need **no API keys, no network and no `data/PROCESSED/`**:
+156 tests in about 16 seconds (incl. `tests/MCP`). They need **no API keys, no network and no `data/PROCESSED/`**:
 external services are replaced by fakes and every database is a temporary file. Only
 `data/EVAL/` (the 150 benchmark questions, tracked in git) is read. GitHub Actions runs the
 same command on every push and pull request (`.github/workflows/tests.yml`).

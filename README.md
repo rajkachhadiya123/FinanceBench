@@ -17,6 +17,9 @@ service with caching, guardrails and request tracing.
 | Answer passage in the top 5 (71 questions whose answer is written in the filing) | 60 / 71 (85%) — holdout 23 / 28 |
 | Typical latency (uncached / cached) | ~2.5–4 s / ~5 ms |
 
+All results were measured with Cerebras `gpt-oss-120b` as the answering model. The code now
+calls DeepSeek (`deepseek-flash`); the 79.3% has not been re-measured on it.
+
 Numeric answers are graded automatically; free-text answers were judged by hand against the
 expected answer with fixed rules. How every number was measured, and what was tried and
 rejected, is in the [experiment log](documentation/experiment_log/README.md); known weaknesses
@@ -32,7 +35,7 @@ Question
  → Qwen3-Embedding-0.6B dense search (top 20)  +  BM25 keyword search (top 20)
  → Reciprocal Rank Fusion → up to 40 candidates
  → Cohere rerank-v4.0-pro → top 5 chunks
- → Cerebras gpt-oss-120b → answer with reasoning and citations
+ → LLM (DeepSeek; measured with Cerebras gpt-oss-120b) → answer with reasoning and citations
      (if "NOT FOUND": retry once with the top 10 of the same reranked list)
  → output checks: figures traceable to the sources · retrieval confidence · disclaimer
  → response + trace id (every step timed and stored)
@@ -52,11 +55,11 @@ LLM can tell which statement a table comes from.
 | **Guardrails** | Rule-based, no LLM. Block only clear abuse (HTTP 400); everything else is a signal next to the answer, which is never changed. None of the 150 benchmark questions is blocked |
 | **Rate limiting** | Per client: 10 `/query` and 30 `/retrieve` per minute (HTTP 429) |
 | **Tracing** | Every request gets an id (`X-Request-ID`) and a stored trace of timed steps, tokens and estimated cost; `GET /traces/{id}`, `GET /stats` |
-| **Tests + CI** | 80 tests, no API keys or data needed; GitHub Actions on every push |
+| **Tests + CI** | 156 tests (incl. the MCP server), no API keys or data needed; GitHub Actions on every push |
 
 ## Quick start
 
-**Requirements:** Python 3.10, ~3 GB of disk, API keys for [Cerebras](https://cloud.cerebras.ai)
+**Requirements:** Python 3.10, ~3 GB of disk, API keys for [DeepSeek](https://platform.deepseek.com)
 (LLM) and [Cohere](https://dashboard.cohere.com) (reranker), and the built indexes in
 `data/PROCESSED/` — see [data/README.md](data/README.md) for how to get the PDFs and build them.
 
@@ -65,7 +68,7 @@ python -m venv .venv
 .venv\Scripts\activate            # Windows   (macOS/Linux: source .venv/bin/activate)
 python -m pip install -r requirements.txt
 
-copy .env.example .env            # then fill in CEREBRAS_API_KEY and COHERE_API_KEY
+copy .env.example .env            # then fill in DEEPSEEK_API_KEY and COHERE_API_KEY
 
 python -m uvicorn source.API.app:app --port 8000
 ```
@@ -113,8 +116,8 @@ Set in `.env` (see [.env.example](.env.example)); only the two API keys are requ
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CEREBRAS_API_KEY`, `COHERE_API_KEY` | — | LLM and reranker |
-| `CEREBRAS_MODEL`, `CEREBRAS_REASONING_EFFORT` | `gpt-oss-120b`, `medium` | Answering model |
+| `DEEPSEEK_API_KEY`, `COHERE_API_KEY` | — | LLM and reranker |
+| `DEEPSEEK_MODEL`, `DEEPSEEK_REASONING_EFFORT`, `DEEPSEEK_MAX_TOKENS` | `deepseek-flash`, `high`, `8000` | Answering model (the Cerebras settings are kept commented out in `answer_generator.py`) |
 | `COHERE_RERANK_MODEL` | `rerank-v4.0-pro` | Reranker |
 | `FILINGLENS_QUERY_PER_MIN`, `FILINGLENS_RETRIEVE_PER_MIN` | `10`, `30` | Rate limits per client |
 | `FILINGLENS_CACHE_PATH`, `FILINGLENS_TRACE_PATH` | `data/PROCESSED/cache.db`, `traces.db` | Storage |
@@ -128,14 +131,14 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -rx
 ```
 
-80 tests in ~11 s, with no API keys, network or `data/PROCESSED` — external services are faked.
+156 tests in ~16 s, with no API keys, network or `data/PROCESSED` — external services are faked.
 They include a check that none of the 150 benchmark questions is blocked by the guardrails.
 One test is an expected failure documenting a known metadata-filter bug. See [tests/README.md](tests/README.md).
 
 ## Reproducing the evaluation
 
 ```bash
-# end-to-end answers on all 150 questions (~45–60 min; ~165 Cerebras + ~150 Cohere calls; answers are cached)
+# end-to-end answers on all 150 questions (~45–60 min; ~165 LLM + ~150 Cohere calls; answers are cached)
 python tools/test_answers.py --include-holdout --n 200 --top-k 5 --retry-top-k 10 --no-targeted --embedding qwen_headed
 
 # retrieval only, 71 questions whose answer is written in the filing
@@ -150,7 +153,7 @@ Details and the other evaluation scripts: [tools/README.md](tools/README.md).
 source/
   INGESTION/    PDF → chunks, embedding and BM25 index builders
   RETRIEVAL/    metadata filter, hybrid retriever, Cohere reranker client
-  GENERATION/   Cerebras answer generator and prompts
+  GENERATION/   answer generator (DeepSeek; Cerebras kept commented out) and prompts
   GUARDRAILS/   input/output checks, rate limiter
   TRACING/      request traces, cost estimates
   SHARED/       SQLite answer cache
@@ -161,6 +164,8 @@ data/           EVAL (questions, in git) · RAW (PDFs) · PROCESSED (indexes, gi
 documentation/  experiment log, limitations, early retrieval reports
 analysis/       early exploration scripts
 experiments/    reserved for evaluation-harness configs (not built yet)
+mcp_server/     MCP server: Project 1's search as tools for AI agents
+docs/           LinkedIn post draft and chart
 deployment/     Docker guide (Dockerfile and docker-compose.yml are in the root)
 ```
 
@@ -172,8 +177,11 @@ deployment/     Docker guide (Dockerfile and docker-compose.yml are in the root)
 | [LIMITATIONS.md](documentation/LIMITATIONS.md) | Where the remaining 31 failures come from; what is not built |
 | [HANDOFF.md](HANDOFF.md) | Working notes for continuing development |
 | [data/README.md](data/README.md) | Data files and how to rebuild the indexes |
+| [mcp_server/README.md](mcp_server/README.md) | MCP server: tools, MCP Inspector, connecting a client |
 
 ## Status
 
-Accuracy work is closed at 79.3%. The API runs locally with Python or Docker. Not built yet:
-an evaluation harness (config-driven runs with an automatic judge) and an AI-agent layer on top of the API.
+Accuracy work is closed at 79.3%. The API runs locally with Python or Docker. An MCP server
+(`mcp_server/`) exposes the search as tools — `search_filings`, `list_filings`, `read_page`,
+`verify_number`, `calculator` — for AI agents. Not built: an evaluation harness
+(config-driven runs with an automatic judge).
