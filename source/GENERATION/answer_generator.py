@@ -1,5 +1,7 @@
 """
-Generates a cited answer from retrieved chunks using an LLM on Cerebras.
+Generates a cited answer from retrieved chunks using an LLM on DeepSeek
+(deepseek-flash, thinking mode). Until 2026-11 this was gpt-oss-120b on Cerebras,
+which produced the measured 79.3%; that setup is kept commented out below.
 
 Prompt design is driven by a measured property of this benchmark: about half of
 FinanceBench answers do not appear anywhere in their own evidence, because the
@@ -35,14 +37,33 @@ from source.TRACING.tracer import span
 
 load_dotenv()
 
-API_URL = "https://api.cerebras.ai/v1/chat/completions"
-DEFAULT_MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
-# "medium" is enough for multi-step arithmetic without wasting the token budget.
-# "high" was tested with prompt v4 on the 31 failed questions: no calculation
-# fixed, and 5 answers came back empty because hidden reasoning used all 6,000
-# completion tokens. Reverted to medium / 3,000 with prompt v2.
-REASONING_EFFORT = os.getenv("CEREBRAS_REASONING_EFFORT", "medium")
-MAX_COMPLETION_TOKENS = 3000
+# --- Cerebras (retired 2026-11; the 79.3% result was measured with this) -----
+# API_URL = "https://api.cerebras.ai/v1/chat/completions"
+# API_KEY_ENV = "CEREBRAS_API_KEY"
+# DEFAULT_MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+# # "medium" is enough for multi-step arithmetic without wasting the token budget.
+# # "high" was tested with prompt v4 on the 31 failed questions: no calculation
+# # fixed, and 5 answers came back empty because hidden reasoning used all 6,000
+# # completion tokens. Reverted to medium / 3,000 with prompt v2.
+# REASONING_EFFORT = os.getenv("CEREBRAS_REASONING_EFFORT", "medium")
+# MAX_COMPLETION_TOKENS = 3000
+# MAX_TOKENS_FIELD = "max_completion_tokens"
+# ------------------------------------------------------------------------------
+
+# --- DeepSeek (active; paid key) ----------------------------------------------
+# Models on this key: deepseek-flash (V4.1-Flash) and deepseek-v4-pro, both 1M context.
+# Thinking mode is on by default. Effort levels are low / high / max -- there is no
+# "medium" (DeepSeek maps it to "high"), so "high" is the closest to the old setting.
+# temperature has no effect in thinking mode; it is still sent for non-thinking runs.
+API_URL = "https://api.deepseek.com/chat/completions"
+API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEFAULT_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
+REASONING_EFFORT = os.getenv("DEEPSEEK_REASONING_EFFORT", "high")
+# Includes the hidden reasoning tokens. 3,000 (the Cerebras value) risks empty answers
+# at "high" effort, as prompt v4 + high showed; 8,000 leaves room for reasoning.
+MAX_COMPLETION_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", "8000"))
+MAX_TOKENS_FIELD = "max_tokens"  # DeepSeek's name; Cerebras used max_completion_tokens
+# ------------------------------------------------------------------------------
 # A 429 asking us to wait longer than this is a spent daily quota: stop the run
 # (answers are cached) instead of sleeping for hours. An exhausted hourly
 # window (150 requests) can ask for up to an hour, which we wait out.
@@ -203,9 +224,9 @@ class DailyLimitReached(Exception):
 
 class AnswerGenerator:
     def __init__(self, model: str | None = None):
-        api_key = os.getenv("CEREBRAS_API_KEY")
+        api_key = os.getenv(API_KEY_ENV)
         if not api_key:
-            raise SystemExit("CEREBRAS_API_KEY not set. Add it to .env")
+            raise SystemExit(f"{API_KEY_ENV} not set. Add it to .env")
         self.client = httpx.Client(headers={"Authorization": f"Bearer {api_key}"},
                                    timeout=120)
         self.model = model or DEFAULT_MODEL
@@ -272,7 +293,7 @@ class AnswerGenerator:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
             "reasoning_effort": REASONING_EFFORT,
-            "max_completion_tokens": MAX_COMPLETION_TOKENS,
+            MAX_TOKENS_FIELD: MAX_COMPLETION_TOKENS,
         }
         while True:
             try:
@@ -291,7 +312,7 @@ class AnswerGenerator:
                 wait = self._retry_after(response)
                 if wait > MAX_RATE_LIMIT_WAIT:
                     raise DailyLimitReached(
-                        f"Cerebras asked to wait {wait:.0f}s -- daily quota reached")
+                        f"LLM provider asked to wait {wait:.0f}s -- daily quota reached")
                 print(f"    [rate limited; waiting {wait:.0f}s]", flush=True)
                 with span("llm.rate_limit_wait", seconds=round(wait)):
                     time.sleep(wait)
