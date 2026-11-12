@@ -28,7 +28,7 @@ async def _session_round_trip():
 
 def test_server_over_stdio():
     tools, ok, bad = asyncio.run(asyncio.wait_for(_session_round_trip(), timeout=60))
-    assert "calculator" in [t.name for t in tools.tools]
+    assert {"calculator", "list_filings"} <= {t.name for t in tools.tools}
     assert json.loads(ok.content[0].text)["result"] == 14
     assert bad.is_error is True
     assert "not allowed" in bad.content[0].text
