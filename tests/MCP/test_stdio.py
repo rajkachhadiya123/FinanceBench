@@ -32,3 +32,34 @@ def test_server_over_stdio():
     assert json.loads(ok.content[0].text)["result"] == 14
     assert bad.is_error is True
     assert "not allowed" in bad.content[0].text
+
+
+def test_stdout_carries_only_protocol_messages():
+    """
+    Regression: PyMuPDF's "fitz API is deprecated" warning goes to stdout. Imported
+    at server start, it reached the client as an unparseable protocol line. Every
+    line the server writes to stdout must be JSON-RPC.
+    """
+    import subprocess
+
+    request = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                          "clientInfo": {"name": "test", "version": "0"}}}
+    proc = subprocess.Popen([sys.executable, "-m", "mcp_server.server"], cwd=ROOT,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, encoding="utf-8")
+    try:
+        proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+        lines = []
+        while True:
+            line = proc.stdout.readline()
+            assert line, f"server closed stdout; got {lines!r}"
+            lines.append(line)
+            message = json.loads(line)  # raises on any stray print
+            if message.get("id") == 1:
+                break
+        assert "result" in message
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)

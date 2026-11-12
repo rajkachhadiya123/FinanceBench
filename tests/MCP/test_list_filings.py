@@ -26,9 +26,9 @@ DOC_NAMES = [
 @pytest.fixture
 def catalog():
     fake = FilingCatalog({name: [0, 1] for name in DOC_NAMES})
-    server.set_catalog(fake)
+    server.catalog.set(fake)
     yield fake
-    server.set_catalog(None)
+    server.catalog.set(None)
 
 
 @pytest.mark.parametrize("name, key", [
